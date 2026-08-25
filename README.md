@@ -120,6 +120,35 @@ node cli.mjs send    --account me "7+8は？" "日本の首都は？" --time
 `--profile` takes a bare name (resolved against `~/.claude/skills/webtrace/profiles/`)
 or a path. Override with `OPENGPT_PROFILE_ROOT` / `OPENGPT_AUTH_DIR`.
 
+## Driving ChatGPT as a worker (orchestration)
+
+ChatGPT can't host Claude Code skills/MCP — it only runs its own side. The model
+is: **Claude Code selects the instructions and passes them into the prompt**;
+opengpt is the pipe. `send` has the primitives for that:
+
+```bash
+# inject instructions (e.g. a selected skill's text) and get structured output
+opengpt send --account me --system "You answer only in haiku." "about summer" --json
+#   → { "results": [{ "text": "...", "conversationId": "6a8d..." }], "timings": {...} }
+
+# continue that same thread later (context — incl. the instructions — persists)
+opengpt send --account me --conversation 6a8d3f24-... "now autumn"
+
+# read the instructions from a file, and/or route to a specific Custom GPT
+opengpt send --account me --system-file ./skill.md --gpt g-xxxx "do the task"
+```
+
+- `--system <text>` / `--system-file <path>` — prepend instructions to each prompt.
+- `--json` — `[{text, conversationId}]` + timings, for a program to consume.
+- `--conversation <id>` — continue an existing thread (verified: the thread keeps
+  its earlier instructions and context).
+- `--gpt <gizmo-id>` — route to a Custom GPT (navigates to `/g/<id>`; best-effort).
+- `--show-id` — print each reply's conversation id to stderr.
+
+ChatGPT only *reasons/generates* (plus its own tools like image-gen); it can't run
+Claude's Bash/MCP. To have it act on tool output, run the tool in Claude Code and
+pass the result into the prompt.
+
 ## Files
 
 ```

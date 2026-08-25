@@ -4,9 +4,9 @@
 // page's obfuscated JS. This does NOT bypass them — it lets the real logged-in
 // page mint them by driving the composer, then reads the streamed answer.
 //
-// Performance: the expensive parts are browser cold-start and the chatgpt.com
-// cold load. Both are amortized when several prompts share one warm page
-// (batch mode), and the load is trimmed by blocking images/fonts/media/ads.
+// Orchestration: `system` prepends instructions (e.g. a selected Claude Code
+// skill), each result carries its conversationId so a caller can continue a
+// thread (`conversationId` input), and `gizmo` routes to a specific Custom GPT.
 import { BASE } from "./config.mjs";
 import { loadAuth, saveAuth } from "./auth.mjs";
 import { openEphemeral } from "./browser.mjs";
@@ -21,7 +21,13 @@ async function readyComposer(page) {
   return composer;
 }
 
-// Send one prompt on an already-open, ready page. Returns {text, timings}.
+// The conversation id lives in the URL as /c/<id> once a turn starts.
+function convIdFromUrl(page) {
+  const m = /\/c\/([^/?#]+)/.exec(page.url());
+  return m ? m[1] : null;
+}
+
+// Send one prompt on an already-open, ready page. Returns {text, conversationId, timings}.
 async function sendOnPage(page, prompt, { timeoutMs = 120000 } = {}) {
   const t = {};
   let s = now();
@@ -60,25 +66,34 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000 } = {}) {
   t.total = now() - s;
 
   const text = await page.locator(ASSISTANT).last().innerText().catch(() => "");
-  return { text: text.trim(), timings: t };
+  return { text: text.trim(), conversationId: convIdFromUrl(page), timings: t };
 }
 
-// Start a fresh conversation. The in-app "new chat" control sits under the
-// sidebar overlay and its click is routinely intercepted, so navigate by URL —
-// a domcontentloaded reload (~1.5s) is reliable and still far cheaper than a
-// browser launch. This is skipped entirely in --same-chat mode.
-async function newChat(page) {
-  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: 60000 });
+// Where a fresh turn should start. A Custom GPT keeps its /g/<gizmo> context;
+// otherwise a new blank chat at /. (The in-app new-chat button sits under the
+// sidebar overlay and its click is routinely intercepted, so navigate by URL.)
+function freshUrl({ gizmo }) {
+  return gizmo ? `${BASE}/g/${gizmo}` : `${BASE}/`;
+}
+
+async function gotoAndReady(page, url) {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await readyComposer(page);
 }
 
 // Batch entry: open the browser once, send every prompt on the warm page.
-// sameChat=true keeps every prompt in one conversation (no nav = fastest, but
-// prompts share context).
-export async function send({ account, prompts, headed = false, lean = false, sameChat = false, timeoutMs = 120000 }) {
+//   system         prepend instruction text to each prompt (skill content, etc.)
+//   conversationId continue an existing thread instead of starting fresh
+//   gizmo          route to a specific Custom GPT (gizmo id)
+//   sameChat       keep every prompt in one conversation (no nav = fastest)
+export async function send({
+  account, prompts, headed = false, lean = false, sameChat = false,
+  system = null, conversationId = null, gizmo = null, timeoutMs = 120000,
+}) {
   if (typeof prompts === "string") prompts = [prompts];
   const auth = loadAuth(account);
   const timings = { launch: 0, load: 0, perPrompt: [] };
+  const frame = (p) => (system ? `${system}\n\n${p}` : p);
 
   let s = now();
   // Ephemeral context seeded from saved cookies — no persistent profile, so no
@@ -89,16 +104,17 @@ export async function send({ account, prompts, headed = false, lean = false, sam
   try {
     const page = context.pages()[0] || (await context.newPage());
     s = now();
-    await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await readyComposer(page);
+    // Start on: an existing conversation, a Custom GPT, or a blank chat.
+    const start = conversationId ? `${BASE}/c/${conversationId}` : freshUrl({ gizmo });
+    await gotoAndReady(page, start);
     timings.load = now() - s;
 
     const results = [];
     for (let i = 0; i < prompts.length; i++) {
-      if (i > 0 && !sameChat) await newChat(page);
-      const r = await sendOnPage(page, prompts[i], { timeoutMs });
+      if (i > 0 && !sameChat) await gotoAndReady(page, freshUrl({ gizmo }));
+      const r = await sendOnPage(page, frame(prompts[i]), { timeoutMs });
       timings.perPrompt.push(r.timings);
-      results.push(r.text);
+      results.push({ text: r.text, conversationId: r.conversationId });
     }
 
     // Persist rotated cookies (cf_bm etc.) so the saved auth stays fresh.

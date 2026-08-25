@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // opengpt — call the ChatGPT web backend-api directly, reusing a logged-in
 // browser profile for auth. See README.md.
+import { readFileSync } from "node:fs";
 import { login, refresh, loadAuth, listAccounts } from "./src/auth.mjs";
 import { api } from "./src/http.mjs";
 import { send } from "./src/send.mjs";
@@ -37,14 +38,18 @@ const HELP = `opengpt — ChatGPT backend-api client
   opengpt get      --account <name> <conversation-id>
   opengpt api      --account <name> <METHOD> <path> [--json '<body>']   raw call
 
-  opengpt send     --account <name> "<p1>" ["<p2>" ...] [--same-chat --headed --lean --time]
-       Sends one or more prompts. Multiple prompts share ONE warm browser, so
-       launch + page-load are paid once. Default starts a fresh chat per prompt;
-       --same-chat keeps them in one conversation (fastest, shared context).
-       NOTE: this is the one command that must use the browser —
-       /f/conversation is gated by Cloudflare Turnstile + a proof-of-work token
-       that cannot be produced from Node. --lean blocks images/fonts/ads
-       (bandwidth, not latency). --time prints a per-stage breakdown.
+  opengpt send     --account <name> "<p1>" ["<p2>" ...]
+       Sends one or more prompts. Multiple prompts share ONE warm browser.
+       Default starts a fresh chat per prompt; --same-chat keeps one conversation.
+       Orchestration flags (for driving ChatGPT as a worker):
+         --system "<text>"      prepend instructions to each prompt
+         --system-file <path>   ...read the instructions from a file (e.g. a skill)
+         --conversation <id>    continue an existing thread instead of a new chat
+         --gpt <gizmo-id>       route to a specific Custom GPT
+         --json                 structured output: [{text, conversationId}] + timings
+         --show-id              print each reply's conversation id (stderr)
+       Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
+       /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
 
 Global:  --via auto|node|browser   (read commands; default auto)
          --raw                      print raw response text
@@ -130,17 +135,29 @@ async function main() {
       need();
       const prompts = args.slice(1);
       if (!prompts.length) throw new Error('usage: opengpt send --account <name> "<prompt>" ["<prompt2>" ...]');
+      const system = opts["system-file"] && opts["system-file"] !== true
+        ? readFileSync(opts["system-file"], "utf8")
+        : (opts.system && opts.system !== true ? opts.system : null);
       const r = await send({
         account,
         prompts,
         headed: !!opts.headed,
-        lean: !!opts.lean,         // --lean blocks images/fonts/ads (saves bandwidth,
-        sameChat: !!opts["same-chat"], // not latency: we gate on domcontentloaded)
+        lean: !!opts.lean,             // blocks images/fonts/ads (bandwidth, not latency)
+        sameChat: !!opts["same-chat"],
+        system,                        // prepend instructions (e.g. a skill's text)
+        conversationId: opts.conversation && opts.conversation !== true ? opts.conversation : null,
+        gizmo: opts.gpt && opts.gpt !== true ? opts.gpt : null, // Custom GPT id
       });
-      r.results.forEach((text, i) => {
-        if (r.results.length > 1) process.stdout.write(`\n=== [${i + 1}] ===\n`);
-        out(text || "(no text captured)");
-      });
+      if (opts.json) {
+        // structured output for orchestration (Claude Code drives this)
+        out({ results: r.results, timings: r.timings });
+      } else {
+        r.results.forEach((res, i) => {
+          if (r.results.length > 1) process.stdout.write(`\n=== [${i + 1}] ===\n`);
+          out(res.text || "(no text captured)");
+          if (opts["show-id"] && res.conversationId) process.stderr.write(`[conversation ${res.conversationId}]\n`);
+        });
+      }
       if (opts.time) {
         const t = r.timings;
         const ms = (v) => `${Math.round(v)}ms`;
