@@ -1,0 +1,70 @@
+// Pure-Node HTTP layer for the Bearer-only backend-api endpoints.
+// Falls back to the browser profile's network stack when Cloudflare blocks
+// the Node client (TLS/JA3 fingerprint), so the same call works either way.
+import { BASE, CLIENT_HEADERS } from "./config.mjs";
+import { cookieHeader, isExpired, refresh, loadAuth } from "./auth.mjs";
+import { openEphemeral } from "./browser.mjs";
+
+function headersFor(auth, extra = {}) {
+  return {
+    ...CLIENT_HEADERS,
+    authorization: `Bearer ${auth.accessToken}`,
+    cookie: cookieHeader(auth),
+    "user-agent": auth.userAgent || "Mozilla/5.0",
+    ...extra,
+  };
+}
+
+// Cloudflare block detection: HTML challenge body or 403/429 from cf.
+function looksBlocked(status, body) {
+  if (status === 403 || status === 429) return true;
+  if (typeof body === "string" && /Just a moment|cf-chl|challenge-platform|Attention Required/i.test(body)) return true;
+  return false;
+}
+
+async function nodeRequest(auth, method, path, { json, headers } = {}) {
+  const r = await fetch(`${BASE}${path}`, {
+    method,
+    headers: headersFor(auth, { ...(json ? { "content-type": "application/json" } : {}), ...headers }),
+    body: json ? JSON.stringify(json) : undefined,
+  });
+  const text = await r.text();
+  return { status: r.status, text, blocked: looksBlocked(r.status, text) };
+}
+
+async function browserRequest(auth, method, path, { json, headers } = {}) {
+  const context = await openEphemeral(auth, {});
+  try {
+    const opts = { headers: headersFor(auth, headers), timeout: 60000 };
+    if (json) { opts.data = json; }
+    const fn = method === "GET" ? context.request.get : context.request.post;
+    const res = await fn.call(context.request, `${BASE}${path}`, opts);
+    return { status: res.status(), text: await res.text(), blocked: false };
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+// Main entry: ensure a fresh token, run the request, auto-fallback to browser.
+export async function api(account, method, path, { json, headers, via = "auto", raw = false } = {}) {
+  let auth = loadAuth(account);
+  if (isExpired(auth)) {
+    await refresh(account, { via: via === "node" ? "node" : "auto" });
+    auth = loadAuth(account);
+  }
+  let res;
+  if (via === "browser") {
+    res = await browserRequest(auth, method, path, { json, headers });
+  } else {
+    res = await nodeRequest(auth, method, path, { json, headers });
+    if (res.blocked && via === "auto") {
+      res = await browserRequest(auth, method, path, { json, headers });
+    }
+  }
+  if (res.status >= 400) {
+    const snippet = res.text.slice(0, 300);
+    throw new Error(`${method} ${path} → ${res.status}${res.blocked ? " (blocked)" : ""}: ${snippet}`);
+  }
+  if (raw) return res.text;
+  try { return JSON.parse(res.text); } catch { return res.text; }
+}

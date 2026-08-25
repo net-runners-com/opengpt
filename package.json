@@ -1,0 +1,16 @@
+{
+  "name": "opengpt",
+  "version": "0.1.0",
+  "description": "Call the ChatGPT web backend-api directly from the CLI, reusing a logged-in browser profile for auth.",
+  "type": "module",
+  "bin": {
+    "opengpt": "./cli.mjs"
+  },
+  "scripts": {
+    "start": "node cli.mjs"
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.5.7",
+    "playwright-core": "^1.62.1"
+  }
+}
