@@ -145,6 +145,23 @@ opengpt send --account me --system-file ./skill.md --gpt g-xxxx "do the task"
 - `--gpt <gizmo-id>` — route to a Custom GPT (navigates to `/g/<id>`; best-effort).
 - `--show-id` — print each reply's conversation id to stderr.
 
+### Image generation
+
+`send` handles image-gen prompts too. The result arrives in a `role="tool"`
+message (the trailing `assistant` turn is an invisible code stub), so `send`
+detects completion via the rendered image, returns the asset URL(s) in
+`images[]`, and with `--save-images <dir>` downloads them through the live
+browser context — the URLs 403 with "File stream access denied" without the
+bearer + cookies. Verified: terminates in ~35s and saves one PNG per image.
+
+```bash
+opengpt send --account me "黄色い花の画像を1枚生成して" --save-images ./out
+#   [image saved] ./out/<conversation-id>-0-0.png
+```
+
+Image generation is gated by the account: some free accounts show "image
+creation unavailable", and free accounts have a daily image cap.
+
 ChatGPT only *reasons/generates* (plus its own tools like image-gen); it can't run
 Claude's Bash/MCP. To have it act on tool output, run the tool in Claude Code and
 pass the result into the prompt.
