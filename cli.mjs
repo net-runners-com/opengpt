@@ -46,8 +46,9 @@ const HELP = `opengpt — ChatGPT backend-api client
          --system-file <path>   ...read the instructions from a file (e.g. a skill)
          --conversation <id>    continue an existing thread instead of a new chat
          --gpt <gizmo-id>       route to a specific Custom GPT
-         --json                 structured output: [{text, conversationId}] + timings
+         --json                 structured output: [{text, images, conversationId}] + timings
          --show-id              print each reply's conversation id (stderr)
+         --save-images <dir>    download generated images (image-gen results) to <dir>
        Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
        /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
 
@@ -147,6 +148,8 @@ async function main() {
         system,                        // prepend instructions (e.g. a skill's text)
         conversationId: opts.conversation && opts.conversation !== true ? opts.conversation : null,
         gizmo: opts.gpt && opts.gpt !== true ? opts.gpt : null, // Custom GPT id
+        saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
+        timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen needs more
       });
       if (opts.json) {
         // structured output for orchestration (Claude Code drives this)
@@ -154,7 +157,10 @@ async function main() {
       } else {
         r.results.forEach((res, i) => {
           if (r.results.length > 1) process.stdout.write(`\n=== [${i + 1}] ===\n`);
-          out(res.text || "(no text captured)");
+          if (res.text) out(res.text);
+          else if (res.savedPaths?.length) out(res.savedPaths.map((p) => `[image saved] ${p}`).join("\n"));
+          else if (res.images?.length) out(res.images.map((u) => `[image] ${u}`).join("\n"));
+          else out("(no text captured)");
           if (opts["show-id"] && res.conversationId) process.stderr.write(`[conversation ${res.conversationId}]\n`);
         });
       }
