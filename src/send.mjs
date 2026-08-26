@@ -34,19 +34,48 @@ function convIdFromUrl(page) {
   return m ? m[1] : null;
 }
 
-// Send one prompt on an already-open, ready page. Returns {text, conversationId, timings}.
-async function sendOnPage(page, prompt, { timeoutMs = 120000 } = {}) {
+// Upload image file(s) into the composer and wait for the upload to finish.
+async function attachImages(page, files, timeoutMs) {
+  const input = page.locator('input[data-testid="upload-photos-input"], input[type="file"][accept="image/*"]').first();
+  await input.setInputFiles(files);
+  // Done when a preview thumbnail (blob:/oaiusercontent) is present and no
+  // spinner remains — sending before this silently drops the attachment.
+  await page.waitForFunction(
+    (n) => {
+      const spin = document.querySelector('[role="progressbar"], .animate-spin, svg.animate-spin');
+      if (spin) return false;
+      const previews = [...document.querySelectorAll("img")].filter((im) => /blob:|oaiusercontent|estuary/.test(im.src));
+      return previews.length >= n;
+    },
+    files.length,
+    { timeout: timeoutMs },
+  );
+}
+
+// Count generated-image srcs currently in main (the pre-send baseline lets us
+// tell an uploaded image apart from a freshly generated one).
+async function mainImageSrcs(page) {
+  return page.evaluate((imgRe) => {
+    const re = new RegExp(imgRe);
+    return [...new Set([...document.querySelectorAll("main img")].map((im) => im.src).filter((ssrc) => re.test(ssrc)))];
+  }, IMG_SRC.source);
+}
+
+// Send one prompt on an already-open, ready page. Returns {text, images, conversationId, timings}.
+async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null } = {}) {
   const t = {};
   let s = now();
   const composer = await readyComposer(page);
   await composer.click();
+  if (attach?.length) { await attachImages(page, attach, timeoutMs); t.upload = now() - s; }
+  await composer.click();
   await page.keyboard.insertText(prompt);
   t.compose = now() - s;
 
-  // Count assistant AND tool turns: image generation lands in a role="tool"
-  // message, and the trailing role="assistant" turn is an invisible `code`
-  // message ({"skipped_mainline":true}) with no text or img of its own.
+  // Baselines captured BEFORE sending: turns, and images already in main (an
+  // uploaded attachment counts here so it isn't mistaken for a result).
   const before = await page.locator(TURN).count();
+  const imgBase = await mainImageSrcs(page);
   s = now();
   await page.keyboard.press("Enter");
 
@@ -66,38 +95,36 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000 } = {}) {
   );
   t.firstToken = now() - s;
 
-  // Done = stop button gone AND a real result exists: a generated image
-  // anywhere in main (image-gen puts it in a tool message), or a non-empty
-  // assistant text turn. Checking the stop button alone races — it can read as
-  // "absent" before generation even starts.
-  await page.waitForFunction(
-    ({ stop, imgRe }) => {
-      if (document.querySelector(stop)) return false;
-      const re = new RegExp(imgRe);
-      const img = [...document.querySelectorAll("main img")].some((im) => re.test(im.src));
-      if (img) return true;
-      const as = document.querySelectorAll('[data-message-author-role="assistant"]');
-      return [...as].some((el) => el.innerText.trim().length > 0);
-    },
-    { stop: STOP_BTN, imgRe: IMG_SRC.source },
-    { timeout: timeoutMs },
-  );
-  t.total = now() - s;
-
-  // Prefer the last assistant turn that actually has text; fall back to the
-  // generated image URL(s) so image-gen results are not lost.
-  const { text, images } = await page.evaluate((imgRe) => {
+  // Poll for completion. A "result" is a NEW generated image (not in the
+  // pre-send baseline, so an uploaded attachment doesn't count) or non-empty
+  // assistant text. Finish when generation stopped (stop button gone) with a
+  // result, OR when the result is stable for a few polls — the stop button does
+  // not reliably disappear for some responses (e.g. image analysis), so relying
+  // on it alone hangs. Uses wall-clock, fine in a normal Node process.
+  const deadline = Date.now() + timeoutMs;
+  let text = "", images = [], lastSig = null, stable = 0;
+  const read = () => page.evaluate(({ imgRe, base }) => {
     const re = new RegExp(imgRe);
+    const baseSet = new Set(base);
     const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     let text = "";
-    for (let i = as.length - 1; i >= 0; i--) {
-      const v = as[i].innerText.trim();
-      if (v) { text = v; break; }
-    }
-    // Image gen references the same asset several times in the DOM — dedupe.
-    const images = [...new Set([...document.querySelectorAll("main img")].map((im) => im.src).filter((ssrc) => re.test(ssrc)))];
-    return { text, images };
-  }, IMG_SRC.source);
+    for (let i = as.length - 1; i >= 0; i--) { const v = as[i].innerText.trim(); if (v) { text = v; break; } }
+    const images = [...new Set([...document.querySelectorAll("main img")].map((im) => im.src).filter((ssrc) => re.test(ssrc) && !baseSet.has(ssrc)))];
+    const stop = !!document.querySelector('button[data-testid="stop-button"]');
+    return { text, images, stop };
+  }, { imgRe: IMG_SRC.source, base: imgBase });
+
+  while (Date.now() < deadline) {
+    const st = await read();
+    text = st.text; images = st.images;
+    const hasResult = text.length > 0 || images.length > 0;
+    if (!st.stop && hasResult) break;                         // clean finish
+    const sig = text + "|" + images.join(",");
+    if (hasResult && sig === lastSig) { if (++stable >= 3) break; } else stable = 0; // stable ~4.5s
+    lastSig = sig;
+    await page.waitForTimeout(1500);
+  }
+  t.total = now() - s;
   return { text, images, conversationId: convIdFromUrl(page), timings: t };
 }
 
@@ -120,7 +147,8 @@ async function gotoAndReady(page, url) {
 //   sameChat       keep every prompt in one conversation (no nav = fastest)
 export async function send({
   account, prompts, headed = false, lean = false, sameChat = false,
-  system = null, conversationId = null, gizmo = null, saveDir = null, timeoutMs = 120000,
+  system = null, conversationId = null, gizmo = null, saveDir = null,
+  attach = null, timeoutMs = 120000,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
   const auth = loadAuth(account);
@@ -144,7 +172,7 @@ export async function send({
     const results = [];
     for (let i = 0; i < prompts.length; i++) {
       if (i > 0 && !sameChat) await gotoAndReady(page, freshUrl({ gizmo }));
-      const r = await sendOnPage(page, frame(prompts[i]), { timeoutMs });
+      const r = await sendOnPage(page, frame(prompts[i]), { timeoutMs, attach });
       timings.perPrompt.push(r.timings);
       const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
       // Download generated images through the live context (cookies attached);

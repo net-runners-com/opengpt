@@ -49,6 +49,7 @@ const HELP = `opengpt — ChatGPT backend-api client
          --json                 structured output: [{text, images, conversationId}] + timings
          --show-id              print each reply's conversation id (stderr)
          --save-images <dir>    download generated images (image-gen results) to <dir>
+         --image <path[,...]>   upload image file(s) with the prompt (vision / edit)
        Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
        /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
 
@@ -149,7 +150,8 @@ async function main() {
         conversationId: opts.conversation && opts.conversation !== true ? opts.conversation : null,
         gizmo: opts.gpt && opts.gpt !== true ? opts.gpt : null, // Custom GPT id
         saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
-        timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen needs more
+        attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
+        timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more
       });
       if (opts.json) {
         // structured output for orchestration (Claude Code drives this)

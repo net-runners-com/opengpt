@@ -162,6 +162,23 @@ opengpt send --account me "黄色い花の画像を1枚生成して" --save-imag
 Image generation is gated by the account: some free accounts show "image
 creation unavailable", and free accounts have a daily image cap.
 
+### Image input (vision)
+
+`--image <path>` uploads image file(s) with the prompt so ChatGPT can analyze
+or edit them. Comma-separate for several. The upload target is the composer's
+photo input; `send` waits for the upload to finish before submitting. Verified:
+a photo + "describe this" returns the description (uploaded images are excluded
+from the result so they aren't mistaken for a generated one).
+
+```bash
+opengpt send --account me --image ./photo.png "この画像を1文で説明して"
+opengpt send --account me --image a.png,b.png "2枚の違いは？"
+```
+
+Completion is detected by result stability, not only the stop button — some
+responses (image analysis in particular) leave the stop button in the DOM after
+the answer is complete.
+
 ChatGPT only *reasons/generates* (plus its own tools like image-gen); it can't run
 Claude's Bash/MCP. To have it act on tool output, run the tool in Claude Code and
 pass the result into the prompt.
