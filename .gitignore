@@ -2,3 +2,4 @@ node_modules/
 auth/
 ahiru.png
 *.png
+.claude/settings.local.json
