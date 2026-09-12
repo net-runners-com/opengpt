@@ -234,6 +234,7 @@ async function main() {
         sameChat: !!opts["same-chat"],
         system,                        // prepend instructions (e.g. a skill's text)
         conversationId,
+        via,                           // how the answer is read back over HTTP
         // --project is the same navigation as --gpt: /g/<id> resolves a
         // project (g-p-…) as well as a Custom GPT.
         gizmo,

@@ -12,6 +12,7 @@ import path from "node:path";
 import { BASE } from "./config.mjs";
 import { loadAuth, saveAuth } from "./auth.mjs";
 import { openEphemeral } from "./browser.mjs";
+import { api } from "./http.mjs";
 
 const now = () => performance.now();
 const ASSISTANT = '[data-message-author-role="assistant"]';
@@ -95,6 +96,40 @@ async function attachDocs(page, files, timeoutMs) {
   }
 }
 
+// ── the answer, read from the API rather than the page ──────────────────────
+//
+// The DOM is a poor source for the text: an answer rendered as a writing block
+// carries the canvas title and the follow-up suggestion chips in the same turn,
+// and the text keeps rendering after the stop button is gone. GET
+// /backend-api/conversation/<id> has the real thing — the message parts plus
+// metadata.is_complete — and it is a plain Bearer call, no browser needed.
+//
+// A writing block arrives fenced, which is presentation, not content:
+//   :::writing{variant="standard" id="58322" title="短くした2本目"}
+//   夜ごはんを作り終わると、…
+//   :::
+const WRITING_FENCE = /^:::writing\{[^}]*\}\s*\n([\s\S]*?)\n?:::\s*$/;
+function unfence(s) {
+  const m = WRITING_FENCE.exec(s.trim());
+  return (m ? m[1] : s).trim();
+}
+
+// The newest assistant text message in a conversation, with its completion flag.
+async function apiAnswer(account, convId, via) {
+  const d = await api(account, "GET", `/backend-api/conversation/${convId}`, { via });
+  let best = null;
+  for (const node of Object.values(d.mapping || {})) {
+    const m = node.message;
+    if (!m || m.author?.role !== "assistant" || m.content?.content_type !== "text") continue;
+    const t = (m.content.parts || []).filter((p) => typeof p === "string").join("\n").trim();
+    if (!t) continue;
+    if (!best || (m.create_time || 0) > (best.t || 0)) {
+      best = { t: m.create_time || 0, text: t, complete: m.metadata?.is_complete === true };
+    }
+  }
+  return best && { text: unfence(best.text), complete: best.complete };
+}
+
 // Count generated-image srcs currently in main (the pre-send baseline lets us
 // tell an uploaded image apart from a freshly generated one).
 async function mainImageSrcs(page) {
@@ -105,7 +140,7 @@ async function mainImageSrcs(page) {
 }
 
 // Send one prompt on an already-open, ready page. Returns {text, images, conversationId, timings}.
-async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, docs = null } = {}) {
+async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, attach = null, docs = null } = {}) {
   const t = {};
   let s = now();
   const composer = await readyComposer(page);
@@ -143,6 +178,9 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
     return { n: as.length, text: "" };
   });
   const imgBase = await mainImageSrcs(page);
+  // API-side baseline too, so a follow-up cannot return the previous answer.
+  let convId = convIdFromUrl(page);
+  const prevApi = convId ? (await apiAnswer(account, convId, via).catch(() => null))?.text ?? null : null;
   s = now();
   await page.keyboard.press("Enter");
 
@@ -220,6 +258,18 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
   }, { imgRe: IMG_SRC.source, base: imgBase, prevN: prev.n, prevText: prev.text });
 
   while (Date.now() < deadline) {
+    // Preferred path: ask the API. It reports the finished text and an explicit
+    // is_complete, so there is nothing to infer from the page.
+    if (!convId) convId = convIdFromUrl(page);
+    if (convId) {
+      const a = await apiAnswer(account, convId, via).catch(() => null);
+      if (a?.complete && a.text && a.text !== prevApi) {
+        text = a.text;
+        images = (await read()).images;
+        break;
+      }
+    }
+
     const st = await read();
     text = st.fresh ? st.text : "";
     images = st.images;
@@ -262,7 +312,7 @@ async function gotoAndReady(page, url) {
 export async function send({
   account, prompts, headed = false, lean = false, sameChat = false,
   system = null, conversationId = null, gizmo = null, saveDir = null,
-  attach = null, docs = null, timeoutMs = 120000,
+  attach = null, docs = null, timeoutMs = 120000, via = "auto",
 }) {
   if (typeof prompts === "string") prompts = [prompts];
   const auth = loadAuth(account);
@@ -286,7 +336,7 @@ export async function send({
     const results = [];
     for (let i = 0; i < prompts.length; i++) {
       if (i > 0 && !sameChat) await gotoAndReady(page, freshUrl({ gizmo }));
-      const r = await sendOnPage(page, frame(prompts[i]), { timeoutMs, attach, docs });
+      const r = await sendOnPage(page, frame(prompts[i]), { account, via, timeoutMs, attach, docs });
       timings.perPrompt.push(r.timings);
       const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
       // Download generated images through the live context (cookies attached);
