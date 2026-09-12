@@ -34,9 +34,61 @@ tokens the page computes in obfuscated JS:
 - `x-conduit-token`
 
 A Turnstile token cannot be minted from Node. So `send` drives the composer in
-the logged-in profile's real page (which mints all three itself) and reads the
-streamed reply. It is the one command that needs a browser. This does not defeat
-the challenge — the real client solves it; we read the answer.
+the logged-in profile's real page (which mints all three itself). It is the one
+command that needs a browser. This does not defeat the challenge — the real
+client solves it; we read the answer.
+
+Pure-code PoW solvers exist and still work
+([leetanshaj/openai-sentinel](https://github.com/leetanshaj/openai-sentinel),
+[lanqian528/chat2api](https://github.com/lanqian528/chat2api)), but the Turnstile
+stage is the one that no longer completes outside a browser, so a browser in the
+loop is the state of the art for this shape of tool — the same conclusion
+[Octo-Lex/ChatGPT-Web2API](https://github.com/Octo-Lex/ChatGPT-Web2API) reaches.
+What is worth minimising is how much of the browser we depend on.
+
+### What the browser is actually for
+
+Submitting the prompt, and nothing else. Everything the turn *produces* comes
+back over plain HTTP:
+
+| | how |
+| --- | --- |
+| put the prompt in and submit it | **DOM** — `#prompt-textarea`, then Enter, falling back to the send button |
+| know the turn started | **DOM** — stop button, or the turn count going up |
+| know the turn finished | **API** — `metadata.is_complete` on the conversation tip |
+| the answer text | **API** — `GET /backend-api/conversation/<id>` |
+| generated images | **API** — `image_asset_pointer` parts |
+| download those images | **API** — `GET /backend-api/files/<file-id>/download` |
+| know an attachment finished uploading | **network** — a finished `process_upload_stream` per file |
+| pick which file input to use | **DOM** — `#upload-files` vs the photo input |
+
+### Reading a turn out of the conversation
+
+`GET /backend-api/conversation/<id>` returns a `mapping` of nodes plus
+`current_node`, the tip. That tip is the whole completion signal:
+
+- **text** — tip is `author.role: "assistant"`, `content_type: "text"`,
+  `metadata.is_complete: true`. A `recipient` other than `"all"` means the
+  message is addressed to a tool and the turn is still in flight.
+- **generated images** — the image lives in a `role: "tool"` /
+  `multimodal_text` message which is *not* the tip: after image gen the tip is
+  an assistant text message with `parts: [""]`, the invisible code stub, and it
+  is the thing carrying `is_complete`. So walk `parent` back from the tip to the
+  turn's user message, collecting `image_asset_pointer` parts on the way. (The
+  walk stops at the user message because that is where *uploaded* images sit.)
+- An asset pointer is `sediment://file_…`; strip the scheme and
+  `GET /backend-api/files/<file-id>/download` returns a signed `download_url`
+  plus the real `file_name`. The signature is not enough on its own — that URL
+  still 403s without the bearer + cookie.
+
+Two traps worth knowing:
+
+- While a turn is in flight the SPA parks a **placeholder id** in the URL,
+  `WEB:<uuid>`. The API answers that with `400 Invalid conversation`, and a
+  1.5s poll on it earns a `429`. Only accept a real uuid.
+- An answer rendered as a writing block arrives fenced —
+  `:::writing{variant="standard" title="…"}` … `:::`. That is presentation:
+  strip it, or the canvas title ends up glued to the first line.
 
 ### send performance (measured, logged-in `google` profile, headless)
 
@@ -246,12 +298,12 @@ opengpt send --account me --system-file ./skill.md --gpt g-xxxx "do the task"
 
 ### Image generation
 
-`send` handles image-gen prompts too. The result arrives in a `role="tool"`
-message (the trailing `assistant` turn is an invisible code stub), so `send`
-detects completion via the rendered image, returns the asset URL(s) in
-`images[]`, and with `--save-images <dir>` downloads them through the live
-browser context — the URLs 403 with "File stream access denied" without the
-bearer + cookies. Verified: terminates in ~35s and saves one PNG per image.
+`send` handles image-gen prompts too. Both the result and the download are pure
+HTTP now: the asset pointers come out of the conversation (see **Reading a turn
+out of the conversation** above), `images[]` carries `{id, mime, width, height}`
+per image, and `--save-images <dir>` resolves each id through
+`/backend-api/files/<id>/download` and fetches it with the bearer + cookie. No
+browser is involved past the submit. Measured: 77s for one image end to end.
 
 ```bash
 opengpt send --account me "黄色い花の画像を1枚生成して" --save-images ./out

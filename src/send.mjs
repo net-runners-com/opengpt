@@ -12,7 +12,7 @@ import path from "node:path";
 import { BASE } from "./config.mjs";
 import { loadAuth, saveAuth } from "./auth.mjs";
 import { openEphemeral } from "./browser.mjs";
-import { api } from "./http.mjs";
+import { api, authHeaders } from "./http.mjs";
 
 const now = () => performance.now();
 const ASSISTANT = '[data-message-author-role="assistant"]';
@@ -22,8 +22,6 @@ const TURN = '[data-message-author-role="assistant"], [data-message-author-role=
 const STOP_BTN = 'button[data-testid="stop-button"]';
 // Only exists once the composer has text — the fallback for a swallowed Enter.
 const SEND_BTN = 'button[data-testid="send-button"], #composer-submit-button';
-// Generated-image sources (oaiusercontent / estuary / files / blob).
-const IMG_SRC = /oaiusercontent|blob:|\/backend-api\/|estuary|\/files\//;
 
 // The prompt box is #prompt-textarea. Do NOT reach for it with a comma
 // selector: a conversation that rendered an answer as a writing block has a
@@ -42,40 +40,33 @@ async function readyComposer(page) {
   }
 }
 
-// The conversation id lives in the URL as /c/<id> once a turn starts.
+// The conversation id lives in the URL as /c/<id> once a turn starts — but
+// while the turn is in flight the SPA parks a PLACEHOLDER there, "WEB:<uuid>".
+// The API rejects that with 400 ("Invalid conversation WEB:…") and answers a
+// burst of retries with 429, so only a real uuid counts.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function convIdFromUrl(page) {
   const m = /\/c\/([^/?#]+)/.exec(page.url());
-  return m ? m[1] : null;
+  return m && UUID.test(m[1]) ? m[1] : null;
 }
 
-// Upload image file(s) into the composer and wait for the upload to finish.
-async function attachImages(page, files, timeoutMs) {
-  const input = page.locator('input[data-testid="upload-photos-input"], input[type="file"][accept="image/*"]').first();
-  await input.setInputFiles(files);
-  // Done when a preview thumbnail (blob:/oaiusercontent) is present and no
-  // spinner remains — sending before this silently drops the attachment.
-  await page.waitForFunction(
-    (n) => {
-      const spin = document.querySelector('[role="progressbar"], .animate-spin, svg.animate-spin');
-      if (spin) return false;
-      const previews = [...document.querySelectorAll("img")].filter((im) => /blob:|oaiusercontent|estuary/.test(im.src));
-      return previews.length >= n;
-    },
-    files.length,
-    { timeout: timeoutMs },
-  );
-}
-
-// Upload document(s) — pdf/txt/csv/docx/… — into the composer.
+// Attach file(s) to the composer.
 //
-// #upload-files is the composer's unrestricted file input (accept=null); the
-// photo input above only takes image/*. The file chip renders the instant the
-// file is *selected* (measured: ~0.6s) while the bytes are still going up
-// (measured on a 4.7 MB txt: POST /backend-api/files at 11.1s,
-// process_upload_stream at 12.4s), and neither a spinner nor a disabled send
-// button ever appears — so the DOM cannot tell "selected" from "uploaded".
-// Wait on the network instead: one finished process_upload_stream per file.
-async function attachDocs(page, files, timeoutMs) {
+// Two inputs: #upload-files takes anything (accept=null), the photo input only
+// image/*. Images go through the photo input because that is what produces an
+// image attachment rather than a document.
+//
+// Completion is a NETWORK fact, not a DOM one. The chip or thumbnail renders
+// the instant the file is *selected* (~0.6s) while the bytes are still going up
+// — on a 4.7 MB txt, POST /backend-api/files fired at 11.1s and
+// process_upload_stream at 12.4s — and no spinner or disabled send button ever
+// appears. Submitting on the chip silently drops the attachment, so wait for
+// one finished process_upload_stream per file, with the old thumbnail check
+// kept only as a fallback for uploads that never stream.
+const PHOTO_INPUT = 'input[data-testid="upload-photos-input"], input[type="file"][accept="image/*"]';
+const ANY_INPUT = "#upload-files";
+
+async function attachFiles(page, files, { images = false, timeoutMs }) {
   const uploads = [];
   const onResp = (r) => {
     if (/\/backend-api\/files\/process_upload_stream/.test(r.url())) {
@@ -84,13 +75,24 @@ async function attachDocs(page, files, timeoutMs) {
   };
   page.on("response", onResp);
   try {
-    await page.locator("#upload-files").first().setInputFiles(files);
+    await page.locator(images ? PHOTO_INPUT : ANY_INPUT).first().setInputFiles(files);
     const deadline = Date.now() + timeoutMs;
     while (uploads.length < files.length && Date.now() < deadline) await page.waitForTimeout(200);
-    if (uploads.length < files.length) {
-      throw new Error(`file upload did not finish (${uploads.length}/${files.length} processed)`);
+    if (uploads.length >= files.length) {
+      await Promise.all(uploads);
+      return;
     }
-    await Promise.all(uploads);
+    if (!images) throw new Error(`file upload did not finish (${uploads.length}/${files.length} processed)`);
+    // Images: some uploads settle without a process_upload_stream. Fall back to
+    // the rendered preview, which at least proves the client accepted them.
+    await page.waitForFunction(
+      (n) => {
+        if (document.querySelector('[role="progressbar"], .animate-spin, svg.animate-spin')) return false;
+        return [...document.querySelectorAll("img")].filter((im) => /blob:|oaiusercontent|estuary/.test(im.src)).length >= n;
+      },
+      files.length,
+      { timeout: 30000 },
+    );
   } finally {
     page.off("response", onResp);
   }
@@ -114,29 +116,62 @@ function unfence(s) {
   return (m ? m[1] : s).trim();
 }
 
-// The newest assistant text message in a conversation, with its completion flag.
+// The tip of the conversation: {nodeId, text, images, complete}.
+//
+// `current_node` is the authoritative tip, so there is no "newest by timestamp"
+// guesswork. What finishes a turn depends on what the turn produced:
+//   - text            assistant / content_type "text" / metadata.is_complete
+//   - generated image tool / "multimodal_text" holding image_asset_pointer parts
+//     (image gen leaves no is_complete anywhere — the tool message IS the end,
+//     and the trailing assistant turn is an invisible code stub)
+// recipient !== "all" means the message is addressed to a tool, i.e. the turn is
+// still mid-flight.
 async function apiAnswer(account, convId, via) {
   const d = await api(account, "GET", `/backend-api/conversation/${convId}`, { via });
-  let best = null;
-  for (const node of Object.values(d.mapping || {})) {
-    const m = node.message;
-    if (!m || m.author?.role !== "assistant" || m.content?.content_type !== "text") continue;
-    const t = (m.content.parts || []).filter((p) => typeof p === "string").join("\n").trim();
-    if (!t) continue;
-    if (!best || (m.create_time || 0) > (best.t || 0)) {
-      best = { t: m.create_time || 0, text: t, complete: m.metadata?.is_complete === true };
+  const nodeId = d.current_node;
+  const map = d.mapping || {};
+  const tip = map[nodeId]?.message;
+  if (!tip) return { nodeId, text: "", images: [], complete: false };
+  const toUser = (m) => (m.recipient || "all") === "all";
+
+  // Images live in a tool message that is NOT the tip: after image gen the tip
+  // is an assistant text message with parts [""] — the invisible code stub —
+  // carrying is_complete. So walk back from the tip to this turn's user message
+  // and collect every asset pointer on the way. (Uploads sit in the user
+  // message itself, which is why the walk stops there rather than including it.)
+  const images = [];
+  for (let id = nodeId, hops = 0; id && hops < 12; hops++) {
+    const m = map[id]?.message;
+    if (m?.author?.role === "user") break;
+    for (const part of m?.content?.parts || []) {
+      if (part && typeof part === "object" && part.content_type === "image_asset_pointer") {
+        const fid = String(part.asset_pointer || "").replace(/^[a-z]+:\/\//, ""); // sediment://file_… → file_…
+        if (fid) images.unshift({ id: fid, mime: part.mime_type || "image/png", width: part.width, height: part.height });
+      }
     }
+    id = map[id]?.parent;
   }
-  return best && { text: unfence(best.text), complete: best.complete };
+
+  let text = "";
+  if (tip.author?.role === "assistant" && tip.content?.content_type === "text" && toUser(tip)) {
+    text = unfence((tip.content.parts || []).filter((p) => typeof p === "string").join("\n").trim());
+  }
+
+  // Done when the tip says so, or when the tip IS the image-bearing tool turn.
+  const finished = tip.metadata?.is_complete === true
+    || (tip.author?.role === "tool" && toUser(tip) && images.length > 0);
+  return { nodeId, text, images, complete: finished && (text.length > 0 || images.length > 0) };
 }
 
-// Count generated-image srcs currently in main (the pre-send baseline lets us
-// tell an uploaded image apart from a freshly generated one).
-async function mainImageSrcs(page) {
-  return page.evaluate((imgRe) => {
-    const re = new RegExp(imgRe);
-    return [...new Set([...document.querySelectorAll("main img")].map((im) => im.src).filter((ssrc) => re.test(ssrc)))];
-  }, IMG_SRC.source);
+// Generated images download over plain HTTP: ask for a signed URL, then fetch it
+// WITH the bearer + cookie — the signature alone gives 403.
+const EXT = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
+async function downloadAsset(account, fileId, via) {
+  const r = await api(account, "GET", `/backend-api/files/${fileId}/download`, { via });
+  if (!r.download_url) throw new Error(`no download_url for ${fileId}`);
+  const res = await fetch(r.download_url, { headers: await authHeaders(account, { via }) });
+  if (!res.ok) throw new Error(`asset ${fileId} → ${res.status}`);
+  return { buf: Buffer.from(await res.arrayBuffer()), name: r.file_name || fileId };
 }
 
 // Send one prompt on an already-open, ready page. Returns {text, images, conversationId, timings}.
@@ -145,8 +180,8 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   let s = now();
   const composer = await readyComposer(page);
   await composer.click();
-  if (attach?.length) { await attachImages(page, attach, timeoutMs); t.upload = now() - s; }
-  if (docs?.length) { await attachDocs(page, docs, timeoutMs); t.upload = now() - s; }
+  if (attach?.length) { await attachFiles(page, attach, { images: true, timeoutMs }); t.upload = now() - s; }
+  if (docs?.length) { await attachFiles(page, docs, { timeoutMs }); t.upload = now() - s; }
   await composer.click();
   await page.keyboard.insertText(prompt);
   // The composer is React-controlled and occasionally ignores an inserted
@@ -177,10 +212,10 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     }
     return { n: as.length, text: "" };
   });
-  const imgBase = await mainImageSrcs(page);
-  // API-side baseline too, so a follow-up cannot return the previous answer.
+  // API-side baseline: remember which node was the tip, so a follow-up cannot
+  // hand back the previous answer (which is itself "complete").
   let convId = convIdFromUrl(page);
-  const prevApi = convId ? (await apiAnswer(account, convId, via).catch(() => null))?.text ?? null : null;
+  const prevNode = convId ? (await apiAnswer(account, convId, via).catch(() => null))?.nodeId ?? null : null;
   s = now();
   await page.keyboard.press("Enter");
 
@@ -195,13 +230,9 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   const started = (ms) =>
     // NOTE: page.waitForFunction takes ONE arg — pass a single object.
     page.waitForFunction(
-      ({ n, sel, stop, imgRe }) => {
-        if (document.querySelector(stop)) return true;
-        if (document.querySelectorAll(sel).length > n) return true;
-        const re = new RegExp(imgRe);
-        return [...document.querySelectorAll("main img")].some((im) => re.test(im.src));
-      },
-      { n: before, sel: TURN, stop: STOP_BTN, imgRe: IMG_SRC.source },
+      ({ n, sel, stop }) =>
+        !!document.querySelector(stop) || document.querySelectorAll(sel).length > n,
+      { n: before, sel: TURN, stop: STOP_BTN },
       { timeout: ms },
     );
   const grace = Math.min(8000, timeoutMs);
@@ -232,10 +263,8 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   // not reliably disappear for some responses (e.g. image analysis), so relying
   // on it alone hangs. Uses wall-clock, fine in a normal Node process.
   const deadline = Date.now() + timeoutMs;
-  let text = "", images = [], lastSig = null, stable = 0;
-  const read = () => page.evaluate(({ imgRe, base, prevN, prevText }) => {
-    const re = new RegExp(imgRe);
-    const baseSet = new Set(base);
+  let text = "", images = [], lastSig = null, stable = 0, polls = 0;
+  const read = () => page.evaluate(({ prevN, prevText }) => {
     const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     // When ChatGPT renders an answer as a writing block it appends clickable
     // follow-up suggestions inside the same turn ("もう少し短くする" …). They are
@@ -249,38 +278,41 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     };
     let text = "";
     for (let i = as.length - 1; i >= 0; i--) { const v = body(as[i]); if (v) { text = v; break; } }
-    const images = [...new Set([...document.querySelectorAll("main img")].map((im) => im.src).filter((ssrc) => re.test(ssrc) && !baseSet.has(ssrc)))];
     const stop = !!document.querySelector('button[data-testid="stop-button"]');
     // On a follow-up the previous answer is still the last assistant turn until
     // the new one renders — don't mistake it for this turn's result.
     const fresh = as.length > prevN || (!!text && text !== prevText);
-    return { text, images, stop, fresh };
-  }, { imgRe: IMG_SRC.source, base: imgBase, prevN: prev.n, prevText: prev.text });
+    return { text, stop, fresh };
+  }, { prevN: prev.n, prevText: prev.text });
 
   while (Date.now() < deadline) {
     // Preferred path: ask the API. It reports the finished text and an explicit
     // is_complete, so there is nothing to infer from the page.
     if (!convId) convId = convIdFromUrl(page);
-    if (convId) {
+    // Every other pass (~3s): often enough to finish promptly, gentle enough to
+    // stay clear of the 429 that a 1.5s poll earns.
+    if (convId && polls++ % 2 === 0) {
       const a = await apiAnswer(account, convId, via).catch(() => null);
-      if (a?.complete && a.text && a.text !== prevApi) {
+      if (process.env.OPENGPT_DEBUG) {
+        process.stderr.write(`[dbg] conv=${convId} node=${a?.nodeId} complete=${a?.complete} imgs=${a?.images?.length}\n`);
+      }
+      if (a?.complete && a.nodeId && a.nodeId !== prevNode) {
         text = a.text;
-        images = (await read()).images;
+        images = a.images;
         break;
       }
     }
 
     const st = await read();
     text = st.fresh ? st.text : "";
-    images = st.images;
-    const hasResult = text.length > 0 || images.length > 0;
+    const hasResult = text.length > 0;
     // Always finish on a quiet period, never on the stop button alone: the
     // button disappears before the last of the text renders on multi-item
     // answers (measured — it truncated a 5-post reply mid-sentence). While the
     // button is still up we may be mid-stream on a slow answer, so demand a
     // much longer quiet period there.
     const needed = st.stop ? 8 : 2; // ~12s while generating, ~3s after
-    const sig = text + "|" + images.join(",");
+    const sig = text;
     if (hasResult && sig === lastSig) { if (++stable >= needed) break; } else stable = 0;
     lastSig = sig;
     await page.waitForTimeout(1500);
@@ -345,13 +377,12 @@ export async function send({
         fs.mkdirSync(saveDir, { recursive: true });
         res.savedPaths = [];
         for (let k = 0; k < res.images.length; k++) {
+          const im = res.images[k];
           try {
-            const resp = await context.request.get(res.images[k], { timeout: 60000 });
-            if (resp.ok()) {
-              const p = path.join(saveDir, `${res.conversationId || "img"}-${i}-${k}.png`);
-              fs.writeFileSync(p, await resp.body());
-              res.savedPaths.push(p);
-            }
+            const { buf } = await downloadAsset(account, im.id, via);
+            const p = path.join(saveDir, `${res.conversationId || "img"}-${i}-${k}.${EXT[im.mime] || "png"}`);
+            fs.writeFileSync(p, buf);
+            res.savedPaths.push(p);
           } catch { /* skip a failed image, keep the rest */ }
         }
       }

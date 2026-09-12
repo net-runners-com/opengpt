@@ -5,6 +5,17 @@ import { BASE, CLIENT_HEADERS } from "./config.mjs";
 import { cookieHeader, isExpired, refresh, loadAuth } from "./auth.mjs";
 import { openEphemeral } from "./browser.mjs";
 
+// Auth headers for a hand-rolled fetch (binary downloads, streaming endpoints)
+// where api() below is the wrong shape. Refreshes an expired bearer first.
+export async function authHeaders(account, { via = "auto", extra } = {}) {
+  let auth = loadAuth(account);
+  if (isExpired(auth)) {
+    await refresh(account, { via: via === "node" ? "node" : "auto" });
+    auth = loadAuth(account);
+  }
+  return headersFor(auth, extra);
+}
+
 function headersFor(auth, extra = {}) {
   return {
     ...CLIENT_HEADERS,

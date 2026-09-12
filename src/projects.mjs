@@ -5,9 +5,8 @@
 // with the webtrace skill; see README "Projects" for the endpoint table.
 import fs from "node:fs";
 import path from "node:path";
-import { api } from "./http.mjs";
-import { BASE, CLIENT_HEADERS } from "./config.mjs";
-import { cookieHeader, isExpired, refresh, loadAuth } from "./auth.mjs";
+import { api, authHeaders } from "./http.mjs";
+import { BASE } from "./config.mjs";
 
 // The UI's two memory settings map onto memory_scope. "unset" is what the web
 // client posts on create; the server resolves it to "global".
@@ -127,20 +126,6 @@ export async function listProjectFiles(account, gid, { via } = {}) {
 //   3. POST /backend-api/files/process_upload_stream → JSONL progress; the
 //      terminal event carries extra.metadata_object_id = the library_file_id
 //   4. POST /backend-api/projects/<gid>/files → attach it as a project source
-
-async function authHeaders(account) {
-  let auth = loadAuth(account);
-  if (isExpired(auth)) {
-    await refresh(account, { via: "auto" });
-    auth = loadAuth(account);
-  }
-  return {
-    ...CLIENT_HEADERS,
-    authorization: `Bearer ${auth.accessToken}`,
-    cookie: cookieHeader(auth),
-    "user-agent": auth.userAgent || "Mozilla/5.0",
-  };
-}
 
 async function uploadOne(account, gid, filePath, { via } = {}) {
   const abs = path.resolve(filePath);
