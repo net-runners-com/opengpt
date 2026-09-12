@@ -192,6 +192,23 @@ opengpt send --account me --project g-p-xxxx "source.txt には何と書いて�
 
 `--instructions-file <path>` reads the project instructions from a file.
 
+### Continuing a chat inside a project
+
+Two ways, both verified against a project chat:
+
+```bash
+# several turns in one invocation — one browser, one conversation
+opengpt send --account me --project g-p-xxxx --same-chat \
+  "平日の夜の投稿を3本。" "3本目、地元の店の話に差し替えて。"
+
+# come back to that conversation later. --project is not needed: the id is
+# enough, and the project's instructions and sources still apply.
+opengpt send --account me --conversation 6aa591bf-… "3番だけもう少し短く。"
+```
+
+`--show-id` prints each conversation id to stderr, `--json` returns it per
+result, and `project chats <gid>` lists every conversation in the project.
+
 ## Driving ChatGPT as a worker (orchestration)
 
 ChatGPT can't host Claude Code skills/MCP — it only runs its own side. The model

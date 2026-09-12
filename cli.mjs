@@ -10,7 +10,18 @@ import {
   listProjectChats, listProjectFiles, moveConversation, addProjectFiles,
 } from "./src/projects.mjs";
 
+// Flags that never take a value. Without this list `--same-chat "prompt"`
+// swallows the prompt as the flag's value and it is never sent. Per-command,
+// because --json is a boolean on `send` (structured output) but carries the
+// request body on `api`.
+const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help"];
+const BOOLEAN_FLAGS = {
+  send: new Set([...COMMON_BOOLEANS, "json"]),
+  _default: new Set(COMMON_BOOLEANS),
+};
+
 function parse(argv) {
+  const bools = BOOLEAN_FLAGS[argv[0]] || BOOLEAN_FLAGS._default;
   const args = [];
   const opts = {};
   for (let i = 0; i < argv.length; i++) {
@@ -18,7 +29,7 @@ function parse(argv) {
     if (a.startsWith("--")) {
       const k = a.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith("--")) opts[k] = true;
+      if (bools.has(k) || next === undefined || next.startsWith("--")) opts[k] = true;
       else { opts[k] = next; i++; }
     } else args.push(a);
   }

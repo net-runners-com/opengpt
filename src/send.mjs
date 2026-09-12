@@ -112,9 +112,25 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
   }
   t.compose = now() - s;
 
-  // Baselines captured BEFORE sending: turns, and images already in main (an
+  // A stop button left over from the previous turn — routine on --same-chat
+  // follow-ups, where it outlives the answer — would make the "generation
+  // started" gate below pass instantly and hand back the PREVIOUS answer.
+  await page
+    .waitForFunction((stop) => !document.querySelector(stop), STOP_BTN, { timeout: 15000 })
+    .catch(() => {});
+
+  // Baselines captured BEFORE sending: turns, the answer already on screen (so
+  // a follow-up cannot return it again), and images already in main (an
   // uploaded attachment counts here so it isn't mistaken for a result).
   const before = await page.locator(TURN).count();
+  const prev = await page.evaluate(() => {
+    const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    for (let i = as.length - 1; i >= 0; i--) {
+      const v = as[i].innerText.trim();
+      if (v) return { n: as.length, text: v };
+    }
+    return { n: as.length, text: "" };
+  });
   const imgBase = await mainImageSrcs(page);
   s = now();
   await page.keyboard.press("Enter");
@@ -157,24 +173,43 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
   // on it alone hangs. Uses wall-clock, fine in a normal Node process.
   const deadline = Date.now() + timeoutMs;
   let text = "", images = [], lastSig = null, stable = 0;
-  const read = () => page.evaluate(({ imgRe, base }) => {
+  const read = () => page.evaluate(({ imgRe, base, prevN, prevText }) => {
     const re = new RegExp(imgRe);
     const baseSet = new Set(base);
     const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    // When ChatGPT renders an answer as a writing block it appends clickable
+    // follow-up suggestions inside the same turn ("もう少し短くする" …). They are
+    // UI, not the answer, so drop them before reading the text.
+    const body = (el) => {
+      const sug = el.querySelector('[data-testid="writing-block-suggested-followups"]');
+      if (!sug) return el.innerText.trim();
+      const c = el.cloneNode(true);
+      c.querySelectorAll('[data-testid="writing-block-suggested-followups"]').forEach((n) => n.remove());
+      return c.innerText.trim();
+    };
     let text = "";
-    for (let i = as.length - 1; i >= 0; i--) { const v = as[i].innerText.trim(); if (v) { text = v; break; } }
+    for (let i = as.length - 1; i >= 0; i--) { const v = body(as[i]); if (v) { text = v; break; } }
     const images = [...new Set([...document.querySelectorAll("main img")].map((im) => im.src).filter((ssrc) => re.test(ssrc) && !baseSet.has(ssrc)))];
     const stop = !!document.querySelector('button[data-testid="stop-button"]');
-    return { text, images, stop };
-  }, { imgRe: IMG_SRC.source, base: imgBase });
+    // On a follow-up the previous answer is still the last assistant turn until
+    // the new one renders — don't mistake it for this turn's result.
+    const fresh = as.length > prevN || (!!text && text !== prevText);
+    return { text, images, stop, fresh };
+  }, { imgRe: IMG_SRC.source, base: imgBase, prevN: prev.n, prevText: prev.text });
 
   while (Date.now() < deadline) {
     const st = await read();
-    text = st.text; images = st.images;
+    text = st.fresh ? st.text : "";
+    images = st.images;
     const hasResult = text.length > 0 || images.length > 0;
-    if (!st.stop && hasResult) break;                         // clean finish
+    // Always finish on a quiet period, never on the stop button alone: the
+    // button disappears before the last of the text renders on multi-item
+    // answers (measured — it truncated a 5-post reply mid-sentence). While the
+    // button is still up we may be mid-stream on a slow answer, so demand a
+    // much longer quiet period there.
+    const needed = st.stop ? 8 : 2; // ~12s while generating, ~3s after
     const sig = text + "|" + images.join(",");
-    if (hasResult && sig === lastSig) { if (++stable >= 3) break; } else stable = 0; // stable ~4.5s
+    if (hasResult && sig === lastSig) { if (++stable >= needed) break; } else stable = 0;
     lastSig = sig;
     await page.waitForTimeout(1500);
   }
