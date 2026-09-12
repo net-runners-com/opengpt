@@ -19,6 +19,8 @@ const ASSISTANT = '[data-message-author-role="assistant"]';
 // other tool output arrive as role="tool").
 const TURN = '[data-message-author-role="assistant"], [data-message-author-role="tool"]';
 const STOP_BTN = 'button[data-testid="stop-button"]';
+// Only exists once the composer has text — the fallback for a swallowed Enter.
+const SEND_BTN = 'button[data-testid="send-button"], #composer-submit-button';
 // Generated-image sources (oaiusercontent / estuary / files / blob).
 const IMG_SRC = /oaiusercontent|blob:|\/backend-api\/|estuary|\/files\//;
 
@@ -101,6 +103,13 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
   if (docs?.length) { await attachDocs(page, docs, timeoutMs); t.upload = now() - s; }
   await composer.click();
   await page.keyboard.insertText(prompt);
+  // The composer is React-controlled and occasionally ignores an inserted
+  // string when it mounted moments before the click (seen on project pages).
+  // Verify the text landed, and retype it as real keystrokes if it did not.
+  if (!(await composer.innerText().catch(() => "")).trim()) {
+    await composer.click();
+    await composer.type(prompt, { delay: 0 });
+  }
   t.compose = now() - s;
 
   // Baselines captured BEFORE sending: turns, and images already in main (an
@@ -112,18 +121,32 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
 
   // Generation started: the stop button appeared, a new turn rendered, or an
   // image is already present. Image gen doesn't reliably keep an assistant/tool
-  // turn in the DOM, so gating on turn-count alone can hang. NOTE:
-  // page.waitForFunction takes ONE arg — pass a single object.
-  await page.waitForFunction(
-    ({ n, sel, stop, imgRe }) => {
-      if (document.querySelector(stop)) return true;
-      if (document.querySelectorAll(sel).length > n) return true;
-      const re = new RegExp(imgRe);
-      return [...document.querySelectorAll("main img")].some((im) => re.test(im.src));
-    },
-    { n: before, sel: TURN, stop: STOP_BTN, imgRe: IMG_SRC.source },
-    { timeout: timeoutMs },
-  );
+  // turn in the DOM, so gating on turn-count alone can hang.
+  //
+  // The Enter is sometimes swallowed — reproducibly on project pages, where the
+  // composer mounts late — and the prompt then sits in the box until the whole
+  // timeout expires. So wait briefly first, and click the send button before
+  // committing to the long wait.
+  const started = (ms) =>
+    // NOTE: page.waitForFunction takes ONE arg — pass a single object.
+    page.waitForFunction(
+      ({ n, sel, stop, imgRe }) => {
+        if (document.querySelector(stop)) return true;
+        if (document.querySelectorAll(sel).length > n) return true;
+        const re = new RegExp(imgRe);
+        return [...document.querySelectorAll("main img")].some((im) => re.test(im.src));
+      },
+      { n: before, sel: TURN, stop: STOP_BTN, imgRe: IMG_SRC.source },
+      { timeout: ms },
+    );
+  const grace = Math.min(8000, timeoutMs);
+  try {
+    await started(grace);
+  } catch {
+    const btn = page.locator(SEND_BTN).first();
+    if (await btn.count()) await btn.click({ timeout: 5000 }).catch(() => {});
+    await started(Math.max(timeoutMs - grace, 5000));
+  }
   t.firstToken = now() - s;
 
   // Poll for completion. A "result" is a NEW generated image (not in the
