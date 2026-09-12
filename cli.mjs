@@ -8,13 +8,14 @@ import { send } from "./src/send.mjs";
 import {
   listProjects, getProject, createProject, updateProject, deleteProject,
   listProjectChats, listProjectFiles, moveConversation, addProjectFiles,
+  latestConversation,
 } from "./src/projects.mjs";
 
 // Flags that never take a value. Without this list `--same-chat "prompt"`
 // swallows the prompt as the flag's value and it is never sent. Per-command,
 // because --json is a boolean on `send` (structured output) but carries the
 // request body on `api`.
-const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help"];
+const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   _default: new Set(COMMON_BOOLEANS),
@@ -72,6 +73,8 @@ const HELP = `opengpt — ChatGPT backend-api client
          --system "<text>"      prepend instructions to each prompt
          --system-file <path>   ...read the instructions from a file (e.g. a skill)
          --conversation <id>    continue an existing thread instead of a new chat
+         --continue             ...or just continue the most recent one
+                                (scoped to --project when given)
          --gpt <gizmo-id>       route to a specific Custom GPT
          --project <g-p-id>     start the chat inside a project
          --json                 structured output: [{text, images, conversationId}] + timings
@@ -215,6 +218,14 @@ async function main() {
       const system = opts["system-file"] && opts["system-file"] !== true
         ? readFileSync(opts["system-file"], "utf8")
         : (opts.system && opts.system !== true ? opts.system : null);
+      const gizmo = (opts.gpt && opts.gpt !== true ? opts.gpt : null)
+        || (opts.project && opts.project !== true ? opts.project : null);
+      let conversationId = opts.conversation && opts.conversation !== true ? opts.conversation : null;
+      // --continue: pick up the most recent chat instead of starting yet
+      // another one. Scoped to the project when --project is given.
+      if (!conversationId && opts.continue) {
+        conversationId = await latestConversation(account, gizmo, { via });
+      }
       const r = await send({
         account,
         prompts,
@@ -222,11 +233,10 @@ async function main() {
         lean: !!opts.lean,             // blocks images/fonts/ads (bandwidth, not latency)
         sameChat: !!opts["same-chat"],
         system,                        // prepend instructions (e.g. a skill's text)
-        conversationId: opts.conversation && opts.conversation !== true ? opts.conversation : null,
+        conversationId,
         // --project is the same navigation as --gpt: /g/<id> resolves a
         // project (g-p-…) as well as a Custom GPT.
-        gizmo: (opts.gpt && opts.gpt !== true ? opts.gpt : null)
-          || (opts.project && opts.project !== true ? opts.project : null),
+        gizmo,
         saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)

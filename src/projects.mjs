@@ -101,6 +101,17 @@ export async function moveConversation(account, conversationId, gid, { via } = {
     { json: { gizmo_id: gid || null }, via });
 }
 
+// The conversation `send --continue` should land in: the most recently updated
+// chat in a project, or the account's most recent chat when no project is
+// given. Null when there is none yet, so the caller starts a fresh one.
+export async function latestConversation(account, gid, { via } = {}) {
+  const r = gid
+    ? await listProjectChats(account, gid, { via })
+    : await api(account, "GET", "/backend-api/conversations?offset=0&limit=1&order=updated", { via });
+  const items = r.items || [];
+  return items.length ? items[0].id : null;
+}
+
 export async function listProjectFiles(account, gid, { via } = {}) {
   const r = await getProject(account, gid, { via });
   return (r.files || []).map((f) => ({

@@ -201,10 +201,20 @@ Two ways, both verified against a project chat:
 opengpt send --account me --project g-p-xxxx --same-chat \
   "平日の夜の投稿を3本。" "3本目、地元の店の話に差し替えて。"
 
-# come back to that conversation later. --project is not needed: the id is
+# keep using the SAME chat across separate invocations, without tracking ids:
+# --continue picks the most recently updated chat in the project.
+opengpt send --account me --project g-p-xxxx --continue "さっきの1本目、もう少し短く。"
+opengpt send --account me --project g-p-xxxx --continue "じゃあ2本目も同じ長さに。"
+
+# or name the conversation explicitly. --project is not needed: the id is
 # enough, and the project's instructions and sources still apply.
 opengpt send --account me --conversation 6aa591bf-… "3番だけもう少し短く。"
 ```
+
+Without `--continue` (or `--conversation`) every invocation starts a new chat,
+so a day of tweaking leaves a dozen near-identical threads in the sidebar.
+`--continue` with no `--project` picks the account's most recent chat instead.
+It starts a fresh chat when the project has none yet.
 
 `--show-id` prints each conversation id to stderr, `--json` returns it per
 result, and `project chats <gid>` lists every conversation in the project.

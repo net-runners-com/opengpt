@@ -24,10 +24,21 @@ const SEND_BTN = 'button[data-testid="send-button"], #composer-submit-button';
 // Generated-image sources (oaiusercontent / estuary / files / blob).
 const IMG_SRC = /oaiusercontent|blob:|\/backend-api\/|estuary|\/files\//;
 
+// The prompt box is #prompt-textarea. Do NOT reach for it with a comma
+// selector: a conversation that rendered an answer as a writing block has a
+// SECOND contenteditable — the canvas editor — and it comes first in DOM order,
+// so `.first()` types the prompt into the canvas and the send never happens.
 async function readyComposer(page) {
-  const composer = page.locator('#prompt-textarea, div[contenteditable="true"]').first();
-  await composer.waitFor({ state: "visible", timeout: 30000 });
-  return composer;
+  const composer = page.locator("#prompt-textarea").first();
+  try {
+    await composer.waitFor({ state: "visible", timeout: 20000 });
+    return composer;
+  } catch {
+    // Older/alternate layouts: any contenteditable inside the composer form.
+    const alt = page.locator('form div[contenteditable="true"]').first();
+    await alt.waitFor({ state: "visible", timeout: 10000 });
+    return alt;
+  }
 }
 
 // The conversation id lives in the URL as /c/<id> once a turn starts.
@@ -156,13 +167,24 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, doc
       { timeout: ms },
     );
   const grace = Math.min(8000, timeoutMs);
-  try {
-    await started(grace);
-  } catch {
-    const btn = page.locator(SEND_BTN).first();
-    if (await btn.count()) await btn.click({ timeout: 5000 }).catch(() => {});
-    await started(Math.max(timeoutMs - grace, 5000));
+  let sent = false;
+  for (let attempt = 0; attempt < 3 && !sent; attempt++) {
+    if (attempt > 0) {
+      // Re-render can wipe the composer out from under us (long threads under
+      // /c/<id> are the usual case), so put the prompt back if it is gone, then
+      // prefer the button over another Enter.
+      if (!(await composer.innerText().catch(() => "")).trim()) {
+        await composer.click();
+        await page.keyboard.insertText(prompt);
+      }
+      const btn = page.locator(SEND_BTN).first();
+      if (await btn.count()) await btn.click({ timeout: 5000 }).catch(() => {});
+      else await page.keyboard.press("Enter");
+    }
+    const budget = attempt === 2 ? Math.max(timeoutMs - 2 * grace, 5000) : grace;
+    try { await started(budget); sent = true; } catch { /* try again */ }
   }
+  if (!sent) throw new Error("generation never started — the prompt was not accepted by the composer");
   t.firstToken = now() - s;
 
   // Poll for completion. A "result" is a NEW generated image (not in the
