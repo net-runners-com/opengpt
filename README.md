@@ -120,6 +120,78 @@ node cli.mjs send    --account me "7+8は？" "日本の首都は？" --time
 `--profile` takes a bare name (resolved against `~/.claude/skills/webtrace/profiles/`)
 or a path. Override with `OPENGPT_PROFILE_ROOT` / `OPENGPT_AUTH_DIR`.
 
+## Projects
+
+Projects are gizmos with `gizmo_type: "snorlax"`. Everything below runs over
+**pure HTTP** — the endpoints take only `authorization` + `cookie`, no sentinel
+proof-of-work and no Turnstile, so no browser is launched. Captured with the
+`webtrace` skill and verified live end-to-end.
+
+| Operation | Endpoint |
+| --- | --- |
+| list | `GET /backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0&limit=N` |
+| create | `POST /backend-api/projects` `{instructions, name, memory_scope}` |
+| show | `GET /backend-api/gizmos/<gid>?include_file_limits=true` (also lists sources) |
+| update | `PATCH /backend-api/projects/<gid>` `{name, instructions, emoji, theme[, memory_scope]}` |
+| delete | `DELETE /backend-api/gizmos/<gid>` → `{"deleted": true}` |
+| chats in it | `GET /backend-api/gizmos/<gid>/conversations?cursor=0` |
+| move a chat | `PATCH /backend-api/conversation/<id>` `{gizmo_id}` (`null` moves it out) |
+| add a source | 4 steps, see below |
+
+`PATCH /backend-api/projects/<gid>` is a **full replace** of
+`name`/`instructions`/`emoji`/`theme` — a partial body 422s — so `project set`
+reads the current project first and fills in whatever you did not pass.
+
+### Memory scope
+
+The UI's two settings are one field, `memory_scope`:
+
+| UI | `memory_scope` | `memory_enabled` |
+| --- | --- | --- |
+| デフォルトメモリ (shared both ways) | `global` | `true` |
+| プロジェクト限定メモリ | `project_v2` | `false` |
+
+The web client posts `"unset"` on create and the server resolves it to `global`.
+`--memory project` on create works directly — no second call needed.
+
+### Adding a source file
+
+Four requests, exactly as the web client does them:
+
+1. `POST /backend-api/files` `{file_name, file_size, use_case:"agent", gizmo_id,
+   mime_type, entry_surface:"project_sources", store_in_library:true, …}`
+   → `{upload_url, file_id}` (presigned Azure blob)
+2. `PUT <upload_url>` — the bytes, with `x-ms-blob-type: BlockBlob` and
+   `x-ms-version: 2020-04-08`. No auth; the URL is presigned.
+3. `POST /backend-api/files/process_upload_stream` — JSONL progress events. The
+   `library_file_id` you need next arrives as `extra.metadata_object_id`, not as
+   a field of its own. `index_for_retrieval` is `true` for text-ish files and
+   `false` for images, matching the web client.
+4. `POST /backend-api/projects/<gid>/files` `{files:[{file_id, name, size, type,
+   last_modified, library_file_id, location:"fs"}]}` — `last_modified` must be an
+   **integer** ms epoch; a fractional `mtimeMs` 422s.
+
+### Usage
+
+```bash
+opengpt projects --account me [--limit 20]
+
+opengpt project new   --account me "研究ノート" --instructions "1行で答えて" --memory project
+opengpt project show  --account me g-p-xxxx
+opengpt project set   --account me g-p-xxxx --memory default --instructions "…"
+opengpt project files --account me g-p-xxxx
+opengpt project add   --account me g-p-xxxx ./notes.md ./data.csv
+opengpt project chats --account me g-p-xxxx
+opengpt project move  --account me <conversation-id> g-p-xxxx    # in
+opengpt project move  --account me <conversation-id> none        # back out
+opengpt project rm    --account me g-p-xxxx
+
+# start a new chat inside a project (browser path, same as --gpt)
+opengpt send --account me --project g-p-xxxx "source.txt には何と書いてある？"
+```
+
+`--instructions-file <path>` reads the project instructions from a file.
+
 ## Driving ChatGPT as a worker (orchestration)
 
 ChatGPT can't host Claude Code skills/MCP — it only runs its own side. The model
@@ -174,6 +246,31 @@ from the result so they aren't mistaken for a generated one).
 opengpt send --account me --image ./photo.png "この画像を1文で説明して"
 opengpt send --account me --image a.png,b.png "2枚の違いは？"
 ```
+
+### File attachments (documents)
+
+`--file <path[,...]>` attaches documents — pdf, txt, csv, md, docx, xlsx… — to
+the chat message. It uses the composer's unrestricted file input
+(`#upload-files`); `--image` stays on the photo input, and the two can be
+combined.
+
+```bash
+opengpt send --account me --file ./規程.txt "添付の宿泊費上限を数字だけで答えて"
+#   9800
+opengpt send --account me --file ./big.txt,./code.txt "添付は何ファイル？"
+```
+
+Waiting for the upload here is **not** a DOM check. The file chip renders the
+moment the file is selected (~0.6 s) while the bytes are still uploading, and
+no spinner or disabled send button ever appears — on a 4.7 MB txt the chip was
+up at 0.6 s but `POST /backend-api/files` only fired at 11.1 s and
+`process_upload_stream` at 12.4 s. Submitting on the chip would silently drop
+the attachment, so `send` instead waits for one **finished**
+`process_upload_stream` response per file.
+
+Use this for a one-off document in a single chat. For material that several
+chats should share, upload it as a project source instead (`project add`) —
+see [Projects](#projects).
 
 Completion is detected by result stability, not only the stop button — some
 responses (image analysis in particular) leave the stop button in the DOM after

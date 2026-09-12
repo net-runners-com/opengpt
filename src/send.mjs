@@ -52,6 +52,36 @@ async function attachImages(page, files, timeoutMs) {
   );
 }
 
+// Upload document(s) — pdf/txt/csv/docx/… — into the composer.
+//
+// #upload-files is the composer's unrestricted file input (accept=null); the
+// photo input above only takes image/*. The file chip renders the instant the
+// file is *selected* (measured: ~0.6s) while the bytes are still going up
+// (measured on a 4.7 MB txt: POST /backend-api/files at 11.1s,
+// process_upload_stream at 12.4s), and neither a spinner nor a disabled send
+// button ever appears — so the DOM cannot tell "selected" from "uploaded".
+// Wait on the network instead: one finished process_upload_stream per file.
+async function attachDocs(page, files, timeoutMs) {
+  const uploads = [];
+  const onResp = (r) => {
+    if (/\/backend-api\/files\/process_upload_stream/.test(r.url())) {
+      uploads.push(r.finished().catch(() => {}));
+    }
+  };
+  page.on("response", onResp);
+  try {
+    await page.locator("#upload-files").first().setInputFiles(files);
+    const deadline = Date.now() + timeoutMs;
+    while (uploads.length < files.length && Date.now() < deadline) await page.waitForTimeout(200);
+    if (uploads.length < files.length) {
+      throw new Error(`file upload did not finish (${uploads.length}/${files.length} processed)`);
+    }
+    await Promise.all(uploads);
+  } finally {
+    page.off("response", onResp);
+  }
+}
+
 // Count generated-image srcs currently in main (the pre-send baseline lets us
 // tell an uploaded image apart from a freshly generated one).
 async function mainImageSrcs(page) {
@@ -62,12 +92,13 @@ async function mainImageSrcs(page) {
 }
 
 // Send one prompt on an already-open, ready page. Returns {text, images, conversationId, timings}.
-async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null } = {}) {
+async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null, docs = null } = {}) {
   const t = {};
   let s = now();
   const composer = await readyComposer(page);
   await composer.click();
   if (attach?.length) { await attachImages(page, attach, timeoutMs); t.upload = now() - s; }
+  if (docs?.length) { await attachDocs(page, docs, timeoutMs); t.upload = now() - s; }
   await composer.click();
   await page.keyboard.insertText(prompt);
   t.compose = now() - s;
@@ -132,7 +163,10 @@ async function sendOnPage(page, prompt, { timeoutMs = 120000, attach = null } = 
 // otherwise a new blank chat at /. (The in-app new-chat button sits under the
 // sidebar overlay and its click is routinely intercepted, so navigate by URL.)
 function freshUrl({ gizmo }) {
-  return gizmo ? `${BASE}/g/${gizmo}` : `${BASE}/`;
+  if (!gizmo) return `${BASE}/`;
+  // A project (g-p-…) lives at /g/<gid>/project — plain /g/<gid> does not
+  // render a usable composer for it. Custom GPTs keep the bare /g/<gizmo>.
+  return gizmo.startsWith("g-p-") ? `${BASE}/g/${gizmo}/project` : `${BASE}/g/${gizmo}`;
 }
 
 async function gotoAndReady(page, url) {
@@ -148,7 +182,7 @@ async function gotoAndReady(page, url) {
 export async function send({
   account, prompts, headed = false, lean = false, sameChat = false,
   system = null, conversationId = null, gizmo = null, saveDir = null,
-  attach = null, timeoutMs = 120000,
+  attach = null, docs = null, timeoutMs = 120000,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
   const auth = loadAuth(account);
@@ -172,7 +206,7 @@ export async function send({
     const results = [];
     for (let i = 0; i < prompts.length; i++) {
       if (i > 0 && !sameChat) await gotoAndReady(page, freshUrl({ gizmo }));
-      const r = await sendOnPage(page, frame(prompts[i]), { timeoutMs, attach });
+      const r = await sendOnPage(page, frame(prompts[i]), { timeoutMs, attach, docs });
       timings.perPrompt.push(r.timings);
       const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
       // Download generated images through the live context (cookies attached);

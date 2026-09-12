@@ -5,6 +5,10 @@ import { readFileSync } from "node:fs";
 import { login, refresh, loadAuth, listAccounts } from "./src/auth.mjs";
 import { api } from "./src/http.mjs";
 import { send } from "./src/send.mjs";
+import {
+  listProjects, getProject, createProject, updateProject, deleteProject,
+  listProjectChats, listProjectFiles, moveConversation, addProjectFiles,
+} from "./src/projects.mjs";
 
 function parse(argv) {
   const args = [];
@@ -38,6 +42,18 @@ const HELP = `opengpt — ChatGPT backend-api client
   opengpt get      --account <name> <conversation-id>
   opengpt api      --account <name> <METHOD> <path> [--json '<body>']   raw call
 
+  opengpt projects --account <name> [--limit N]        list projects
+  opengpt project  --account <name> <sub> ...          projects (gizmo_type snorlax)
+       new "<name>" [--instructions <t>|--instructions-file <p>] [--memory default|project]
+       show   <gid>                      full project resource (incl. sources)
+       set    <gid> [--name <t>] [--instructions <t>] [--memory default|project]
+       rm     <gid>                      delete the project
+       files  <gid>                      list its sources
+       add    <gid> <file> [<file>...]   upload source file(s)
+       chats  <gid>                      conversations inside it
+       move   <conversation-id> <gid|none>   move a chat in (or out with none)
+       --memory default = shared with global memory · project = project-only memory
+
   opengpt send     --account <name> "<p1>" ["<p2>" ...]
        Sends one or more prompts. Multiple prompts share ONE warm browser.
        Default starts a fresh chat per prompt; --same-chat keeps one conversation.
@@ -46,10 +62,12 @@ const HELP = `opengpt — ChatGPT backend-api client
          --system-file <path>   ...read the instructions from a file (e.g. a skill)
          --conversation <id>    continue an existing thread instead of a new chat
          --gpt <gizmo-id>       route to a specific Custom GPT
+         --project <g-p-id>     start the chat inside a project
          --json                 structured output: [{text, images, conversationId}] + timings
          --show-id              print each reply's conversation id (stderr)
          --save-images <dir>    download generated images (image-gen results) to <dir>
          --image <path[,...]>   upload image file(s) with the prompt (vision / edit)
+         --file <path[,...]>    attach document(s) to the chat (pdf/txt/csv/docx/…)
        Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
        /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
 
@@ -133,6 +151,52 @@ async function main() {
       return;
     }
 
+    case "projects": {
+      need();
+      out(await listProjects(account, { limit: opts.limit || 20, via }));
+      return;
+    }
+
+    case "project": {
+      need();
+      const sub = args[1];
+      const str = (k) => (opts[k] && opts[k] !== true ? opts[k] : undefined);
+      const instructions = opts["instructions-file"] && opts["instructions-file"] !== true
+        ? readFileSync(opts["instructions-file"], "utf8")
+        : str("instructions");
+      switch (sub) {
+        case "new": {
+          const name = args[2] || str("name");
+          const g = await createProject(account, { name, instructions: instructions ?? "", memory: str("memory"), via });
+          out({ id: g.id, name: g.display?.name, memory_scope: g.memory_scope, memory_enabled: g.memory_enabled });
+          return;
+        }
+        case "show":  out(await getProject(account, args[2], { via })); return;
+        case "set": {
+          const g = await updateProject(account, args[2], { name: str("name"), instructions, memory: str("memory"), via });
+          out({ id: g.id, name: g.display?.name, instructions: g.instructions, memory_scope: g.memory_scope, memory_enabled: g.memory_enabled });
+          return;
+        }
+        case "rm":    out(await deleteProject(account, args[2], { via })); return;
+        case "files": out(await listProjectFiles(account, args[2], { via })); return;
+        case "chats": out(await listProjectChats(account, args[2], { via })); return;
+        case "add": {
+          const files = args.slice(3);
+          if (!files.length) throw new Error("usage: opengpt project add --account <n> <gid> <file> [<file>...]");
+          out(await addProjectFiles(account, args[2], files, { via }));
+          return;
+        }
+        case "move": {
+          const conv = args[2], target = args[3];
+          if (!conv || !target) throw new Error("usage: opengpt project move --account <n> <conversation-id> <gid|none>");
+          out(await moveConversation(account, conv, target === "none" ? null : target, { via }));
+          return;
+        }
+        default:
+          throw new Error(`unknown project subcommand: ${sub}\n\n${HELP}`);
+      }
+    }
+
     case "send": {
       need();
       const prompts = args.slice(1);
@@ -148,9 +212,13 @@ async function main() {
         sameChat: !!opts["same-chat"],
         system,                        // prepend instructions (e.g. a skill's text)
         conversationId: opts.conversation && opts.conversation !== true ? opts.conversation : null,
-        gizmo: opts.gpt && opts.gpt !== true ? opts.gpt : null, // Custom GPT id
+        // --project is the same navigation as --gpt: /g/<id> resolves a
+        // project (g-p-…) as well as a Custom GPT.
+        gizmo: (opts.gpt && opts.gpt !== true ? opts.gpt : null)
+          || (opts.project && opts.project !== true ? opts.project : null),
         saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
+        docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)
         timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more
       });
       if (opts.json) {

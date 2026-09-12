@@ -35,10 +35,10 @@ async function nodeRequest(auth, method, path, { json, headers } = {}) {
 async function browserRequest(auth, method, path, { json, headers } = {}) {
   const context = await openEphemeral(auth, {});
   try {
-    const opts = { headers: headersFor(auth, headers), timeout: 60000 };
+    const opts = { method, headers: headersFor(auth, headers), timeout: 60000 };
     if (json) { opts.data = json; }
-    const fn = method === "GET" ? context.request.get : context.request.post;
-    const res = await fn.call(context.request, `${BASE}${path}`, opts);
+    // .fetch() rather than .get()/.post() so PATCH and DELETE fall back too.
+    const res = await context.request.fetch(`${BASE}${path}`, opts);
     return { status: res.status(), text: await res.text(), blocked: false };
   } finally {
     await context.close().catch(() => {});
