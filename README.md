@@ -246,27 +246,30 @@ opengpt send --account me --project g-p-xxxx "source.txt には何と書いて�
 
 ### Continuing a chat inside a project
 
-Two ways, both verified against a project chat:
+`send` continues the most recently updated chat by default — scoped to the
+project when `--project` is given, the account's newest otherwise:
 
 ```bash
+# separate invocations, same thread. No ids to track.
+opengpt send --account me --project g-p-xxxx "さっきの1本目、もう少し短く。"
+opengpt send --account me --project g-p-xxxx "じゃあ2本目も同じ長さに。"
+
+# a new topic deserves a new chat
+opengpt send --account me --project g-p-xxxx --new "夕方の投稿を1本。"
+
 # several turns in one invocation — one browser, one conversation
 opengpt send --account me --project g-p-xxxx --same-chat \
   "平日の夜の投稿を3本。" "3本目、地元の店の話に差し替えて。"
-
-# keep using the SAME chat across separate invocations, without tracking ids:
-# --continue picks the most recently updated chat in the project.
-opengpt send --account me --project g-p-xxxx --continue "さっきの1本目、もう少し短く。"
-opengpt send --account me --project g-p-xxxx --continue "じゃあ2本目も同じ長さに。"
 
 # or name the conversation explicitly. --project is not needed: the id is
 # enough, and the project's instructions and sources still apply.
 opengpt send --account me --conversation 6aa591bf-… "3番だけもう少し短く。"
 ```
 
-Without `--continue` (or `--conversation`) every invocation starts a new chat,
-so a day of tweaking leaves a dozen near-identical threads in the sidebar.
-`--continue` with no `--project` picks the account's most recent chat instead.
-It starts a fresh chat when the project has none yet.
+The default used to be a fresh chat per invocation, which left a dozen
+near-identical threads in the sidebar after a day of tweaking one set of posts.
+`--new` is the opt-out, and it is also what happens automatically when the
+project has no chats yet.
 
 `--show-id` prints each conversation id to stderr, `--json` returns it per
 result, and `project chats <gid>` lists every conversation in the project.

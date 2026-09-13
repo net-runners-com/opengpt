@@ -15,7 +15,7 @@ import {
 // swallows the prompt as the flag's value and it is never sent. Per-command,
 // because --json is a boolean on `send` (structured output) but carries the
 // request body on `api`.
-const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue"];
+const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   _default: new Set(COMMON_BOOLEANS),
@@ -68,13 +68,14 @@ const HELP = `opengpt — ChatGPT backend-api client
 
   opengpt send     --account <name> "<p1>" ["<p2>" ...]
        Sends one or more prompts. Multiple prompts share ONE warm browser.
-       Default starts a fresh chat per prompt; --same-chat keeps one conversation.
+       Continues the most recent chat by default (scoped to --project when
+       given); --new starts a fresh one. With several prompts, --same-chat
+       keeps them in one conversation instead of a chat each.
        Orchestration flags (for driving ChatGPT as a worker):
          --system "<text>"      prepend instructions to each prompt
          --system-file <path>   ...read the instructions from a file (e.g. a skill)
-         --conversation <id>    continue an existing thread instead of a new chat
-         --continue             ...or just continue the most recent one
-                                (scoped to --project when given)
+         --conversation <id>    continue one specific thread
+         --new                  start a fresh chat instead of continuing
          --gpt <gizmo-id>       route to a specific Custom GPT
          --project <g-p-id>     start the chat inside a project
          --json                 structured output: [{text, images, conversationId}] + timings
@@ -221,9 +222,10 @@ async function main() {
       const gizmo = (opts.gpt && opts.gpt !== true ? opts.gpt : null)
         || (opts.project && opts.project !== true ? opts.project : null);
       let conversationId = opts.conversation && opts.conversation !== true ? opts.conversation : null;
-      // --continue: pick up the most recent chat instead of starting yet
-      // another one. Scoped to the project when --project is given.
-      if (!conversationId && opts.continue) {
+      // Continue the most recent chat by default — a day of tweaking one set of
+      // posts should not leave a dozen near-identical threads in the sidebar.
+      // Scoped to the project when --project is given; --new opts out.
+      if (!conversationId && !opts.new) {
         conversationId = await latestConversation(account, gizmo, { via });
       }
       const r = await send({
