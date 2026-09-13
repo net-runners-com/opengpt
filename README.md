@@ -116,6 +116,49 @@ and blocked assets load after that anyway, so it's off by default. The
 challenge widget host (`challenges.cloudflare.com`) and all app/API hosts are
 never blocked.
 
+### Warm daemon (optional)
+
+`send` pays browser launch + SPA boot every time — measured 1.5s + 3.2s. A
+daemon holds one warm page so navigation happens in-page instead:
+
+```bash
+opengpt send --account me --daemon "…"     # starts one on demand, reuses it after
+opengpt daemon --account me status
+opengpt daemon --account me stop
+opengpt daemon --account me start --idle 0 # run it in the foreground, never expire
+```
+
+| | cold | via daemon |
+| --- | --- | --- |
+| browser launch | ~1500ms | **0ms** |
+| navigation | 1650–3200ms | **3–35ms** |
+| generation | 4.5–8s | unchanged (server-bound) |
+
+Everything left is the model generating, so this is the floor.
+
+**It exits after 300s idle** (`--idle <sec>`, `0` disables,
+`OPENGPT_DAEMON_IDLE` sets the default). That matters: while it runs it holds
+~0.9GB and the single free cloakbrowser session, so **webtrace cannot launch**.
+Letting it expire gives both back — measured 992MB → 0MB once the timer fired.
+`--lean` is on by default here (~0.9GB vs ~1.2GB); images now come from the API
+rather than the DOM, so blocking them costs nothing. `--no-daemon` on a single
+send bypasses it.
+
+Two details worth knowing if you touch this code:
+
+- The page is reused across sends, so it accumulates state — a writing block
+  leaves a second `contenteditable` behind, long threads re-mount the composer.
+  It force-reloads every 20 sends (`OPENGPT_DAEMON_RESET_AFTER`) and after any
+  error.
+- In-page routing needs `pushState` **plus** a dispatched `popstate` event —
+  `pushState` alone changes the URL and leaves the old conversation rendered,
+  because the router listens for the event (verified: turns 10 → 0 only with
+  it). Navigating to the conversation you are already in is a no-op, compared
+  by conversation id: inside a project the URL is `/g/<gid>/c/<id>` while the
+  target is built as `/c/<id>`, and a string compare there cost 11s per send.
+- It listens on a Unix socket (0600), not a TCP port — a live authenticated
+  session behind `localhost:NNNN` would be usable by anything on the machine.
+
 ### Runs in parallel with an open browser — never disturbs it
 
 You can keep a browser open on the profile and use every command at the same

@@ -336,6 +336,51 @@ async function gotoAndReady(page, url) {
   await readyComposer(page);
 }
 
+// Client-side navigation, for a warm page that is already on chatgpt.com.
+// A full goto re-downloads and re-boots the SPA (~1.7s measured); routing
+// in-page costs ~50ms. pushState ALONE does not work — the URL changes and the
+// old conversation stays rendered — because the router listens for popstate,
+// so the event has to be dispatched too (measured: turns 10 → 0).
+// Returns false when the page is not somewhere this can work from.
+async function softNav(page, url) {
+  if (!/^https:\/\/chatgpt\.com/.test(page.url())) return false;
+  const target = url.replace(BASE, "") || "/";
+  try {
+    // Already there — nothing to navigate. Compare by conversation id, not by
+    // raw path: inside a project the URL is /g/<gid>/c/<id> while the target is
+    // built as /c/<id>, so a string compare misses and softNav would wait out
+    // its whole timeout (turns never change) before falling back to a reload.
+    const here = new URL(page.url()).pathname;
+    const convOf = (u) => (/\/c\/([^/?#]+)/.exec(u) || [])[1] || null;
+    const hereConv = convOf(here), wantConv = convOf(target);
+    if (wantConv ? hereConv === wantConv : here === target.split("?")[0]) {
+      await readyComposer(page);
+      return true;
+    }
+    const before = await page.locator(TURN).count();
+    await page.evaluate((t) => {
+      window.history.pushState({}, "", t);
+      window.dispatchEvent(new PopStateEvent("popstate", { state: {} }));
+    }, target);
+    // The route took effect when the old turns are gone (new chat) or replaced.
+    await page.waitForFunction(
+      ({ sel, n, want }) =>
+        location.pathname === want && (document.querySelectorAll(sel).length !== n || n === 0),
+      { sel: TURN, n: before, want: target.split("?")[0] },
+      { timeout: 8000 },
+    );
+    await readyComposer(page);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function navReady(page, url) {
+  if (await softNav(page, url)) return;
+  await gotoAndReady(page, url);
+}
+
 // Batch entry: open the browser once, send every prompt on the warm page.
 //   system         prepend instruction text to each prompt (skill content, etc.)
 //   conversationId continue an existing thread instead of starting fresh
@@ -345,6 +390,9 @@ export async function send({
   account, prompts, headed = false, lean = false, sameChat = false,
   system = null, conversationId = null, gizmo = null, saveDir = null,
   attach = null, docs = null, timeoutMs = 120000, via = "auto",
+  // A warm context from the daemon. When given, send() borrows it and leaves
+  // it open; otherwise it launches one and closes it on the way out.
+  context: borrowed = null,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
   const auth = loadAuth(account);
@@ -354,20 +402,23 @@ export async function send({
   let s = now();
   // Ephemeral context seeded from saved cookies — no persistent profile, so no
   // lock and no conflict with a concurrent run on the same account.
-  const context = await openEphemeral(auth, { headed, lean });
-  timings.launch = now() - s;
+  const context = borrowed || (await openEphemeral(auth, { headed, lean }));
+  timings.launch = borrowed ? 0 : now() - s;
 
   try {
     const page = context.pages()[0] || (await context.newPage());
     s = now();
     // Start on: an existing conversation, a Custom GPT, or a blank chat.
     const start = conversationId ? `${BASE}/c/${conversationId}` : freshUrl({ gizmo });
-    await gotoAndReady(page, start);
+    // A borrowed page is already on chatgpt.com, so route in-page instead of
+    // paying the full SPA boot again.
+    if (borrowed) await navReady(page, start);
+    else await gotoAndReady(page, start);
     timings.load = now() - s;
 
     const results = [];
     for (let i = 0; i < prompts.length; i++) {
-      if (i > 0 && !sameChat) await gotoAndReady(page, freshUrl({ gizmo }));
+      if (i > 0 && !sameChat) await navReady(page, freshUrl({ gizmo }));
       const r = await sendOnPage(page, frame(prompts[i]), { account, via, timeoutMs, attach, docs });
       timings.perPrompt.push(r.timings);
       const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
@@ -397,6 +448,6 @@ export async function send({
 
     return { results, timings };
   } finally {
-    await context.close().catch(() => {});
+    if (!borrowed) await context.close().catch(() => {});
   }
 }

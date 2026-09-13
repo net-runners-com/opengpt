@@ -10,12 +10,13 @@ import {
   listProjectChats, listProjectFiles, moveConversation, addProjectFiles,
   latestConversation,
 } from "./src/projects.mjs";
+import * as daemon from "./src/daemon.mjs";
 
 // Flags that never take a value. Without this list `--same-chat "prompt"`
 // swallows the prompt as the flag's value and it is never sent. Per-command,
 // because --json is a boolean on `send` (structured output) but carries the
 // request body on `api`.
-const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new"];
+const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "no-lean"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   _default: new Set(COMMON_BOOLEANS),
@@ -66,6 +67,13 @@ const HELP = `opengpt — ChatGPT backend-api client
        move   <conversation-id> <gid|none>   move a chat in (or out with none)
        --memory default = shared with global memory · project = project-only memory
 
+  opengpt daemon   --account <name> start|stop|status [--idle <sec>] [--headed] [--no-lean]
+       Keep one warm browser so send skips launch + SPA boot (~4.7s -> ~0.04s).
+       Exits after 300s idle by default (--idle 0 = never), so the ~0.9GB and
+       the single free cloakbrowser session come back when you stop working.
+       send uses it automatically when it is up; --no-daemon opts out.
+       While it runs, webtrace cannot launch — stop it first.
+
   opengpt send     --account <name> "<p1>" ["<p2>" ...]
        Sends one or more prompts. Multiple prompts share ONE warm browser.
        Continues the most recent chat by default (scoped to --project when
@@ -76,6 +84,8 @@ const HELP = `opengpt — ChatGPT backend-api client
          --system-file <path>   ...read the instructions from a file (e.g. a skill)
          --conversation <id>    continue one specific thread
          --new                  start a fresh chat instead of continuing
+         --daemon               start a warm daemon on demand (auto-exits when idle)
+         --no-daemon            launch a private browser even if a daemon is up
          --gpt <gizmo-id>       route to a specific Custom GPT
          --project <g-p-id>     start the chat inside a project
          --json                 structured output: [{text, images, conversationId}] + timings
@@ -212,6 +222,29 @@ async function main() {
       }
     }
 
+    case "daemon": {
+      need();
+      const sub = args[1] || "status";
+      if (sub === "status") { out(await daemon.status(account)); return; }
+      if (sub === "stop")   { out(await daemon.stop(account)); return; }
+      if (sub === "start") {
+        const idleMs = opts.idle && opts.idle !== true ? Number(opts.idle) * 1000 : daemon.DEFAULT_IDLE_MS;
+        const d = await daemon.serve(account, {
+          headed: !!opts.headed,
+          lean: !opts["no-lean"],   // lean by default: ~0.9GB instead of ~1.2GB
+          idleMs,
+        });
+        process.stderr.write(
+          `daemon up · account ${account} · pid ${d.pid} · ${d.socket}` +
+          (idleMs ? ` · idle stop after ${idleMs / 1000}s` : "") +
+          `\nsend uses it automatically. Ctrl-C or \`opengpt daemon --account ${account} stop\` to stop.\n`,
+        );
+        await d.wait();          // hold the process open
+        return;
+      }
+      throw new Error(`unknown daemon subcommand: ${sub} (start|stop|status)`);
+    }
+
     case "send": {
       need();
       const prompts = args.slice(1);
@@ -228,8 +261,7 @@ async function main() {
       if (!conversationId && !opts.new) {
         conversationId = await latestConversation(account, gizmo, { via });
       }
-      const r = await send({
-        account,
+      const sendArgs = {
         prompts,
         headed: !!opts.headed,
         lean: !!opts.lean,             // blocks images/fonts/ads (bandwidth, not latency)
@@ -244,7 +276,22 @@ async function main() {
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)
         timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more
-      });
+      };
+      // Hand the work to the daemon when one is up: it owns a warm page, so
+      // this skips browser launch + SPA boot entirely. Falling back on a
+      // daemon-side failure would launch a second browser and trip the
+      // one-session limit, so let the error surface instead.
+      // Use a daemon when one is up. --daemon also starts one on demand: it
+      // exits on its idle timer, so the memory and the cloakbrowser session
+      // come back when you stop working instead of being held forever.
+      let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);
+      if (!useDaemon && opts.daemon && !opts["no-daemon"]) {
+        await daemon.ensure(account, { lean: !opts["no-lean"] });
+        useDaemon = true;
+      }
+      const r = useDaemon
+        ? await daemon.request(account, { op: "send", args: sendArgs })
+        : await send({ account, ...sendArgs });
       if (opts.json) {
         // structured output for orchestration (Claude Code drives this)
         out({ results: r.results, timings: r.timings });
