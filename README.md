@@ -138,11 +138,26 @@ Everything left is the model generating, so this is the floor.
 
 **It exits after 300s idle** (`--idle <sec>`, `0` disables,
 `OPENGPT_DAEMON_IDLE` sets the default). That matters: while it runs it holds
-~0.9GB and the single free cloakbrowser session, so **webtrace cannot launch**.
-Letting it expire gives both back — measured 992MB → 0MB once the timer fired.
-`--lean` is on by default here (~0.9GB vs ~1.2GB); images now come from the API
-rather than the DOM, so blocking them costs nothing. `--no-daemon` on a single
-send bypasses it.
+~570MB and the single free cloakbrowser session, so **webtrace cannot launch**.
+Letting it expire gives both back (measured: 573MB → 0MB once the timer fired).
+`--no-daemon` on a single send bypasses it.
+
+Measure this with `footprint -p <pid>`, not by summing `ps -o rss` across the
+Chromium processes — RSS counts shared pages once per process, which overstated
+the total by ~35% (885MB summed vs 573MB real).
+
+Where it goes, and what does *not* move it:
+
+| | phys_footprint |
+| --- | --- |
+| browser process with no page | ~460MB |
+| + chatgpt.com loaded | ~573MB |
+| `--lean` (blocks images/fonts/ads) | 564MB vs 561MB — **no effect** |
+| page dropped to `about:blank` | ~400MB, and waking costs 3.4s |
+
+`--lean` is kept for bandwidth, not memory. Hibernating the page to
+`about:blank` frees about a third but keeps the session seat and makes waking
+as expensive as a cold start, so exiting outright wins on every axis.
 
 Two details worth knowing if you touch this code:
 
