@@ -20,6 +20,8 @@ const ASSISTANT = '[data-message-author-role="assistant"]';
 // other tool output arrive as role="tool").
 const TURN = '[data-message-author-role="assistant"], [data-message-author-role="tool"]';
 const STOP_BTN = 'button[data-testid="stop-button"]';
+const RATE_LIMIT_MODAL = '[data-testid="modal-conversation-history-rate-limit"]';
+const LOGGED_OUT = '#modal-no-auth-login, [data-testid="login-button"]';
 // Only exists once the composer has text — the fallback for a swallowed Enter.
 const SEND_BTN = 'button[data-testid="send-button"], #composer-submit-button';
 
@@ -126,7 +128,7 @@ function unfence(s) {
 //     and the trailing assistant turn is an invisible code stub)
 // recipient !== "all" means the message is addressed to a tool, i.e. the turn is
 // still mid-flight.
-async function apiAnswer(account, convId, via) {
+export async function apiAnswer(account, convId, via) {
   const d = await api(account, "GET", `/backend-api/conversation/${convId}`, { via });
   const nodeId = d.current_node;
   const map = d.mapping || {};
@@ -158,7 +160,14 @@ async function apiAnswer(account, convId, via) {
   }
 
   // Done when the tip says so, or when the tip IS the image-bearing tool turn.
+  //
+  // is_complete is NOT reliable on its own: some finished answers never get it
+  // (nor finish_details) — measured 2026-09-13, "8" sat as status
+  // finished_successfully + end_turn true with no is_complete, and send waited
+  // out its whole 120s timeout on an answer that was done at +2.8s. status and
+  // end_turn are on every message; while streaming they read in_progress/null.
   const finished = tip.metadata?.is_complete === true
+    || (tip.author?.role === "assistant" && tip.status === "finished_successfully" && tip.end_turn === true)
     || (tip.author?.role === "tool" && toUser(tip) && images.length > 0);
   return { nodeId, text, images, complete: finished && (text.length > 0 || images.length > 0) };
 }
@@ -179,6 +188,22 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   const t = {};
   let s = now();
   const composer = await readyComposer(page);
+  // Too many history reads — and GET /backend-api/conversation from this CLI
+  // counts — and the app lays a modal over the composer. Every click then
+  // burns a 30s timeout with a Playwright call log for an error, so say so.
+  if (await page.locator(RATE_LIMIT_MODAL).count()) {
+    throw Object.assign(
+      new Error("ChatGPT is rate-limiting this account (conversation-history modal) — wait a while, or use another account"),
+      { code: "RATE_LIMITED" },
+    );
+  }
+  // Saved cookies that no longer hold a web session still load a working
+  // composer — logged out. The prompt then goes out as an anonymous chat that
+  // never reaches the account (seen 2026-09-13 on an account whose Bearer
+  // still worked over HTTP), so refuse rather than answer from the wrong place.
+  if (await page.locator(LOGGED_OUT).count()) {
+    throw new Error("the ChatGPT page is logged out for this account — run `opengpt login` again");
+  }
   await composer.click();
   if (attach?.length) { await attachFiles(page, attach, { images: true, timeoutMs }); t.upload = now() - s; }
   if (docs?.length) { await attachFiles(page, docs, { timeoutMs }); t.upload = now() - s; }
@@ -217,6 +242,27 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   let convId = convIdFromUrl(page);
   const prevNode = convId ? (await apiAnswer(account, convId, via).catch(() => null))?.nodeId ?? null : null;
   s = now();
+
+  // This turn's answer stream. Its closing is the moment the answer is done;
+  // polling the API alone noticed that up to ~2.4s late (measured: [DONE] at
+  // 4.8s, detected at 7.2s). Armed just before Enter so the PREVIOUS turn's
+  // stream cannot match — on a warm page it is often still closing ~0.8s into
+  // the next send. (/f/conversation/prepare is a different path.)
+  let streamClosed = false, streamConv = null, wake = () => {};
+  page
+    .waitForResponse(
+      (r) => r.request().method() === "POST" && new URL(r.url()).pathname === "/backend-api/f/conversation",
+      { timeout: timeoutMs },
+    )
+    .then(async (r) => {
+      await r.finished();
+      // The id is in the stream, for when the URL still holds the WEB: placeholder.
+      streamConv = /"conversation_id":\s*"([0-9a-f-]{36})"/.exec(await r.text().catch(() => ""))?.[1] || null;
+      streamClosed = true;
+      if (process.env.OPENGPT_DEBUG) process.stderr.write(`[dbg] +${Math.round(now() - s)}ms stream closed conv=${streamConv}\n`);
+      wake();
+    })
+    .catch(() => {});
   await page.keyboard.press("Enter");
 
   // Generation started: the stop button appeared, a new turn rendered, or an
@@ -263,7 +309,8 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   // not reliably disappear for some responses (e.g. image analysis), so relying
   // on it alone hangs. Uses wall-clock, fine in a normal Node process.
   const deadline = Date.now() + timeoutMs;
-  let text = "", images = [], lastSig = null, stable = 0, polls = 0;
+  let text = "", images = [], lastSig = null, stable = 0;
+  let nextApiAt = Date.now() + 6000, apiGap = 1000, closedSeen = false;
   const read = () => page.evaluate(({ prevN, prevText }) => {
     const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     // When ChatGPT renders an answer as a writing block it appends clickable
@@ -288,19 +335,27 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   while (Date.now() < deadline) {
     // Preferred path: ask the API. It reports the finished text and an explicit
     // is_complete, so there is nothing to infer from the page.
-    if (!convId) convId = convIdFromUrl(page);
-    // Every other pass (~3s): often enough to finish promptly, gentle enough to
-    // stay clear of the 429 that a 1.5s poll earns.
-    if (convId && polls++ % 2 === 0) {
-      const a = await apiAnswer(account, convId, via).catch(() => null);
+    if (!convId) convId = convIdFromUrl(page) || streamConv;
+    // The API rate-limits a steady poll (429 — and every warm send adds to the
+    // same bucket), so ask it when there is a reason to: right as this turn's
+    // stream closes, then backing off 1s → 2s → 4s while the answer commits.
+    // While the stream is still open, only a slow fallback poll, for the page
+    // that drops its stream while the server finishes the answer anyway.
+    if (streamClosed && !closedSeen) { closedSeen = true; nextApiAt = 0; }
+    if (convId && Date.now() >= nextApiAt) {
+      let err = null;
+      const a = await apiAnswer(account, convId, via).catch((e) => { err = e; return null; });
       if (process.env.OPENGPT_DEBUG) {
-        process.stderr.write(`[dbg] conv=${convId} node=${a?.nodeId} complete=${a?.complete} imgs=${a?.images?.length}\n`);
+        process.stderr.write(`[dbg] +${Math.round(now() - s)}ms conv=${convId} node=${a?.nodeId} complete=${a?.complete} imgs=${a?.images?.length}${err ? ` error=${err.message.slice(0, 80)}` : ""}\n`);
       }
       if (a?.complete && a.nodeId && a.nodeId !== prevNode) {
         text = a.text;
         images = a.images;
         break;
       }
+      if (err && /→ 429/.test(err.message)) nextApiAt = Date.now() + 8000;
+      else if (streamClosed) { nextApiAt = Date.now() + apiGap; apiGap = Math.min(apiGap * 2, 4000); }
+      else nextApiAt = Date.now() + 6000;
     }
 
     const st = await read();
@@ -315,7 +370,11 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     const sig = text;
     if (hasResult && sig === lastSig) { if (++stable >= needed) break; } else stable = 0;
     lastSig = sig;
-    await page.waitForTimeout(1500);
+    // Sleep, but wake the moment the stream closes.
+    await new Promise((r) => {
+      const tm = setTimeout(r, streamClosed ? 700 : 1500);
+      wake = () => { clearTimeout(tm); r(); };
+    });
   }
   t.total = now() - s;
   return { text, images, conversationId: convIdFromUrl(page), timings: t };

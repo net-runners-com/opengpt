@@ -55,7 +55,7 @@ back over plain HTTP:
 | --- | --- |
 | put the prompt in and submit it | **DOM** — `#prompt-textarea`, then Enter, falling back to the send button |
 | know the turn started | **DOM** — stop button, or the turn count going up |
-| know the turn finished | **API** — `metadata.is_complete` on the conversation tip |
+| know the turn finished | **network** wakes it — this turn's `POST /backend-api/f/conversation` stream closing; **API** confirms — the conversation tip |
 | the answer text | **API** — `GET /backend-api/conversation/<id>` |
 | generated images | **API** — `image_asset_pointer` parts |
 | download those images | **API** — `GET /backend-api/files/<file-id>/download` |
@@ -67,9 +67,12 @@ back over plain HTTP:
 `GET /backend-api/conversation/<id>` returns a `mapping` of nodes plus
 `current_node`, the tip. That tip is the whole completion signal:
 
-- **text** — tip is `author.role: "assistant"`, `content_type: "text"`,
-  `metadata.is_complete: true`. A `recipient` other than `"all"` means the
-  message is addressed to a tool and the turn is still in flight.
+- **text** — tip is `author.role: "assistant"`, `content_type: "text"`, and
+  either `metadata.is_complete: true` or `status: "finished_successfully"` with
+  `end_turn: true`. `is_complete` alone is not enough: some finished answers
+  never get it (nor `finish_details`), and waiting for it ran a 2.8s answer out
+  to the full 120s timeout. A `recipient` other than `"all"` means the message
+  is addressed to a tool and the turn is still in flight.
 - **generated images** — the image lives in a `role: "tool"` /
   `multimodal_text` message which is *not* the tip: after image gen the tip is
   an assistant text message with `parts: [""]`, the invisible code stub, and it
@@ -86,6 +89,12 @@ Two traps worth knowing:
 - While a turn is in flight the SPA parks a **placeholder id** in the URL,
   `WEB:<uuid>`. The API answers that with `400 Invalid conversation`, and a
   1.5s poll on it earns a `429`. Only accept a real uuid.
+- Conversation reads share one rate limit with the page's own sidebar history.
+  Poll `GET /backend-api/conversation/<id>` steadily across a burst of sends and
+  the page puts a `modal-conversation-history-rate-limit` over the composer,
+  which stays up for 15+ minutes. So `send` reads the tip once when the
+  turn's stream closes (1s → 2s → 4s back-off if it isn't committed yet), and
+  polls only every 6s while the stream is still open.
 - An answer rendered as a writing block arrives fenced —
   `:::writing{variant="standard" title="…"}` … `:::`. That is presentation:
   strip it, or the canvas title ends up glued to the first line.

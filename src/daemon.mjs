@@ -177,8 +177,10 @@ export async function serve(account, { headed = false, lean = true, idleMs = DEF
         served++; sinceReset++;
         sock.end(JSON.stringify({ ok: true, result }) + "\n");
       } catch (e) {
-        // A broken page should not poison every later request.
-        sinceReset = RESET_AFTER;
+        // A broken page should not poison every later request. A rate limit is
+        // not a broken page, though: the reload refetches the sidebar history,
+        // which is the very limit that tripped, and keeps it tripped.
+        if (e.code !== "RATE_LIMITED") sinceReset = RESET_AFTER;
         sock.end(JSON.stringify({ ok: false, error: e.message }) + "\n");
       } finally {
         busy = false;

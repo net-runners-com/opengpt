@@ -26,10 +26,15 @@ function headersFor(auth, extra = {}) {
   };
 }
 
-// Cloudflare block detection: HTML challenge body or 403/429 from cf.
+// Cloudflare block detection: an HTML challenge page, or a non-JSON 403.
+//
+// A JSON 403/429 is the API itself refusing — {"detail":"Too many requests"},
+// "Unusual activity" — and a browser retry gets the same answer. Treating 429
+// as a block launched a whole second browser per rate-limited poll (measured
+// 2026-09-13: 15 launches in one daemon run, every one still 429).
 function looksBlocked(status, body) {
-  if (status === 403 || status === 429) return true;
   if (typeof body === "string" && /Just a moment|cf-chl|challenge-platform|Attention Required/i.test(body)) return true;
+  if (status === 403 && typeof body === "string" && !/^\s*[{[]/.test(body)) return true;
   return false;
 }
 
@@ -69,6 +74,7 @@ export async function api(account, method, path, { json, headers, via = "auto", 
   } else {
     res = await nodeRequest(auth, method, path, { json, headers });
     if (res.blocked && via === "auto") {
+      if (process.env.OPENGPT_DEBUG) process.stderr.write(`[dbg] ${method} ${path} → ${res.status} over node; launching a browser to retry\n`);
       res = await browserRequest(auth, method, path, { json, headers });
     }
   }
