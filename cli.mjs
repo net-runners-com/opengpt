@@ -106,7 +106,8 @@ const HELP = `opengpt — ChatGPT backend-api client
        context, resets the growth); --list shows all sessions. Never lands
        in an unrelated persona thread and never starts a new chat every turn.
        Uses the daemon when up (--daemon starts one on demand). Prints only the
-       reply. Powers /openg. Also: --system/-file, --json, --show-id,
+       reply. Powers /openg. Images: --save-images <dir> saves generated images;
+       --image/--file attach input. Also: --system/-file, --json, --show-id,
        --no-daemon, --timeout.
 
 Global:  --via auto|node|browser   (read commands; default auto)
@@ -399,7 +400,10 @@ async function main() {
         system: opts["system-file"] && opts["system-file"] !== true
           ? readFileSync(opts["system-file"], "utf8")
           : (opts.system && opts.system !== true ? opts.system : null),
-        timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000,
+        timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : (opts["save-images"] ? 180000 : 120000),
+        saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
+        attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null,
+        docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null,
       };
 
       let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);
@@ -431,9 +435,9 @@ async function main() {
 
       if (opts.json) { out({ results: r.results, timings: r.timings }); return; }
       if (res.text) out(res.text);
-      else if (res.savedPaths?.length) out(res.savedPaths.map((p) => `[image saved] ${p}`).join("\n"));
-      else if (res.images?.length) out(res.images.map((u) => `[image] ${u}`).join("\n"));
-      else out("(no text captured)");
+      if (res.savedPaths?.length) out(res.savedPaths.map((p) => `[image saved] ${p}`).join("\n"));
+      else if (res.images?.length && !res.text) out(res.images.map((u) => `[image] ${u}`).join("\n"));
+      else if (!res.text && !res.savedPaths?.length) out("(no text captured)");
       if (opts["show-id"] && res.conversationId) process.stderr.write(`[conversation ${res.conversationId}]\n`);
       return;
     }
