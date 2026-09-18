@@ -391,7 +391,19 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     // much longer quiet period there.
     const needed = st.stop ? 8 : 2; // ~12s while generating, ~3s after
     const sig = text;
-    if (hasResult && sig === lastSig) { if (++stable >= needed) break; } else stable = 0;
+    if (hasResult && sig === lastSig) {
+      if (++stable >= needed) {
+        // The DOM says the answer is stable, but the DOM is a dirty text source
+        // (UI artifacts like reactions, follow-up chips). Prefer the API's clean
+        // JSON text; keep the scraped text only when the API can't be read (429).
+        if (convId) {
+          const a = await apiAnswer(account, convId, via).catch(() => null);
+          const stale = continuing && prevNode === null && a?.text && a.text === prev.text;
+          if (a?.complete && a.nodeId && a.nodeId !== prevNode && !stale) { text = a.text; images = a.images; }
+        }
+        break;
+      }
+    } else stable = 0;
     lastSig = sig;
     // Sleep, but wake the moment the stream closes.
     await new Promise((r) => {
