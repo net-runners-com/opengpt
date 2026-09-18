@@ -22,7 +22,7 @@ import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "no-lean"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
-  chat: new Set([...COMMON_BOOLEANS, "json", "list"]),
+  chat: new Set([...COMMON_BOOLEANS, "json", "list", "compact"]),
   _default: new Set(COMMON_BOOLEANS),
 };
 
@@ -99,10 +99,11 @@ const HELP = `opengpt — ChatGPT backend-api client
        Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
        /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
 
-  opengpt chat     --account <name> [--session <name>] "<message>" [--new] | --list
+  opengpt chat     --account <name> [--session <name>] "<message>" [--new] | --list | --compact
        Direct back-and-forth. Each --session keeps its OWN ChatGPT thread (work,
        personal, …); default is one shared thread. --new resets that session's
-       thread; --list shows all sessions with their conversation id. Never lands
+       thread; --compact summarises it then reseeds a fresh thread (keeps the
+       context, resets the growth); --list shows all sessions. Never lands
        in an unrelated persona thread and never starts a new chat every turn.
        Uses the daemon when up (--daemon starts one on demand). Prints only the
        reply. Powers /openg. Also: --system/-file, --json, --show-id,
@@ -355,12 +356,41 @@ async function main() {
       }
 
       const message = args.slice(1).join(" ").trim();
-      if (!message) throw new Error('usage: opengpt chat --account <name> [--session <name>] "<message>" [--new]  (or --list)');
+      if (!message && !opts.compact) throw new Error('usage: opengpt chat --account <name> [--session <name>] "<message>" [--new]  (or --list, --compact)');
 
       const statePath = stateFile(session);
       let convId = null;
       if (!opts.new) {
         try { convId = JSON.parse(fs.readFileSync(statePath, "utf8")).conversationId || null; } catch {}
+      }
+
+      // Compaction: a long thread eventually overflows ChatGPT's own context
+      // window and degrades. Summarise the current thread, then reseed a FRESH
+      // thread with that summary and point the session at it — continuity kept,
+      // growth reset. With a message, that message is the first turn of the new
+      // thread; without one, the summary is printed so you can see what carried.
+      if (opts.compact) {
+        if (!convId) throw new Error(`no thread to compact for session "${session}" — send something first`);
+        const runSend = async (a) => {
+          let useD = !opts["no-daemon"] && await daemon.isRunning(account);
+          if (!useD && opts.daemon && !opts["no-daemon"]) { await daemon.ensure(account, { lean: !opts["no-lean"] }); useD = true; }
+          return useD ? daemon.request(account, { op: "send", args: a }) : send({ account, ...a });
+        };
+        const sumPrompt = "これまでの会話の要点・前提・決定事項・私について覚えておくべきことを、簡潔な箇条書きで日本語でまとめてください。以後もこれを前提に会話を続けられるように。";
+        const summary = (await runSend({ prompts: [sumPrompt], conversationId: convId, via, timeoutMs: 120000 })).results[0]?.text || "";
+        const seed = `これは前のスレッドの要約です。これを前提に会話を継続してください。\n\n${summary}`;
+        const first = message
+          ? await runSend({ prompts: [message], conversationId: null, system: seed, via, timeoutMs: 120000 })
+          : await runSend({ prompts: [seed], conversationId: null, via, timeoutMs: 120000 });
+        const newConv = first.results[0]?.conversationId || null;
+        if (newConv) {
+          ensureAuthDir();
+          fs.writeFileSync(statePath, JSON.stringify({ conversationId: newConv, updated: new Date().toISOString() }, null, 2));
+          try { fs.chmodSync(statePath, 0o600); } catch {}
+        }
+        process.stderr.write(`[compacted session "${session}": ${convId} → ${newConv}]\n`);
+        out(message ? (first.results[0]?.text || "(no text captured)") : summary);
+        return;
       }
       const sendArgs = {
         prompts: [message],
