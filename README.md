@@ -147,9 +147,8 @@ Everything left is the model generating, so this is the floor.
 
 **It exits after 300s idle** (`--idle <sec>`, `0` disables,
 `OPENGPT_DAEMON_IDLE` sets the default). That matters: while it runs it holds
-~570MB and the single free cloakbrowser session, so **webtrace cannot launch**.
-Letting it expire gives both back (measured: 573MB → 0MB once the timer fired).
-`--no-daemon` on a single send bypasses it.
+~570MB. Letting it expire gives that back (measured: 573MB → 0MB once the timer
+fired). `--no-daemon` on a single send bypasses it.
 
 Measure this with `footprint -p <pid>`, not by summing `ps -o rss` across the
 Chromium processes — RSS counts shared pages once per process, which overstated
@@ -200,9 +199,12 @@ time. Nothing here ever hijacks or closes that browser.
 - The persistent-launch path refuses to start over a *live* profile (naming the
   pid) and auto-cleans a *stale* lock left by a crash.
 
-Hard limit worth knowing: the **free cloakbrowser binary allows one concurrent
-session**, so two `send`s can't truly run at the same instant — run them
-sequentially (lock-free, no cleanup needed). A Pro license lifts the cap.
+Worth knowing about concurrency: the free **v146** binary this runs on does
+**not** enforce a one-session cap — two `send`s, and the daemon alongside a
+webtrace (persistent-profile) browser, run fine at once (measured 2026-09-18:
+two `launchContext` sessions, and a real daemon plus a `launchPersistentContext`,
+all live simultaneously). The latest **v150** free key advertises *one* concurrent
+session, so on that binary they would conflict; a Pro license lifts it.
 cloakbrowser also encrypts its own cookie store with a key that isn't the
 standard macOS keychain entry, so cookies can't be harvested from a live profile
 without a browser — which is why first-time `login` needs the profile free once.

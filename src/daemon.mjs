@@ -10,8 +10,8 @@
 // localhost:NNNN is usable by anything on the machine. A Unix socket with 0600
 // is reachable only by this user.
 //
-// One browser, one page, one request at a time. The free cloakbrowser binary
-// allows a single concurrent session anyway, and the page is shared state.
+// One browser, one page, one request at a time — the warm page is shared state,
+// so requests to the daemon serialize.
 import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
@@ -28,9 +28,9 @@ export function socketPath(account) {
 }
 
 const RESET_AFTER = Number(process.env.OPENGPT_DAEMON_RESET_AFTER || 20);
-// Idle life. A daemon that never exits holds ~0.9GB and the single free
-// cloakbrowser session forever; one that exits when you stop working costs
-// nothing between bursts. Override with --idle, 0 disables.
+// Idle life. A daemon that never exits holds ~0.9GB forever; one that exits
+// when you stop working costs nothing between bursts. Override with --idle,
+// 0 disables.
 export const DEFAULT_IDLE_MS = Number(process.env.OPENGPT_DAEMON_IDLE || 300) * 1000;
 
 function connect(account) {

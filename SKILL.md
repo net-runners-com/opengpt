@@ -92,8 +92,10 @@ Each `send` pays browser launch (~1.5s) + SPA boot (~3.2s). Two ways around it:
 
 - `--same-chat` with several prompts — one browser for the batch.
 - `--daemon` — starts a warm daemon on demand, navigation drops to ~30ms. It
-  holds ~570MB and the single free cloakbrowser session, so **webtrace cannot
-  launch while it runs**; it exits after 300s idle, or `daemon stop`.
+  holds ~570MB while alive; it exits after 300s idle, or `daemon stop`. (The old
+  "webtrace can't launch while the daemon runs" claim is wrong on the free v146
+  binary — measured two cloakbrowser sessions, and the daemon alongside a
+  webtrace persistent-profile browser, running fine at once.)
 
 ## Gotchas that cost real debugging time
 

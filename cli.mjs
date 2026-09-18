@@ -11,6 +11,9 @@ import {
   latestConversation,
 } from "./src/projects.mjs";
 import * as daemon from "./src/daemon.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 
 // Flags that never take a value. Without this list `--same-chat "prompt"`
 // swallows the prompt as the flag's value and it is never sent. Per-command,
@@ -19,6 +22,7 @@ import * as daemon from "./src/daemon.mjs";
 const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "no-lean"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
+  chat: new Set([...COMMON_BOOLEANS, "json"]),
   _default: new Set(COMMON_BOOLEANS),
 };
 
@@ -69,10 +73,9 @@ const HELP = `opengpt — ChatGPT backend-api client
 
   opengpt daemon   --account <name> start|stop|status [--idle <sec>] [--headed] [--no-lean]
        Keep one warm browser so send skips launch + SPA boot (~4.7s -> ~0.04s).
-       Exits after 300s idle by default (--idle 0 = never), so the ~0.9GB and
-       the single free cloakbrowser session come back when you stop working.
+       Exits after 300s idle by default (--idle 0 = never), so the ~0.9GB it
+       holds comes back when you stop working.
        send uses it automatically when it is up; --no-daemon opts out.
-       While it runs, webtrace cannot launch — stop it first.
 
   opengpt send     --account <name> "<p1>" ["<p2>" ...]
        Sends one or more prompts. Multiple prompts share ONE warm browser.
@@ -95,6 +98,14 @@ const HELP = `opengpt — ChatGPT backend-api client
          --file <path[,...]>    attach document(s) to the chat (pdf/txt/csv/docx/…)
        Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
        /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
+
+  opengpt chat     --account <name> "<message>" [--new]
+       Direct back-and-forth: keeps ONE dedicated conversation per account
+       (stored in the auth dir), so it never lands in an unrelated persona
+       thread and never starts a new chat every turn. --new resets the thread.
+       Uses the daemon when up (--daemon starts one on demand). Prints only the
+       reply. Powers the /openg slash command. Also: --system/-file, --json,
+       --show-id, --no-daemon, --timeout.
 
 Global:  --via auto|node|browser   (read commands; default auto)
          --raw                      print raw response text
@@ -279,11 +290,11 @@ async function main() {
       };
       // Hand the work to the daemon when one is up: it owns a warm page, so
       // this skips browser launch + SPA boot entirely. Falling back on a
-      // daemon-side failure would launch a second browser and trip the
-      // one-session limit, so let the error surface instead.
+      // daemon-side failure would launch a second browser and risk a duplicate
+      // send, so let the error surface instead.
       // Use a daemon when one is up. --daemon also starts one on demand: it
-      // exits on its idle timer, so the memory and the cloakbrowser session
-      // come back when you stop working instead of being held forever.
+      // exits on its idle timer, so the memory comes back when you stop working
+      // instead of being held forever.
       let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);
       if (!useDaemon && opts.daemon && !opts["no-daemon"]) {
         await daemon.ensure(account, { lean: !opts["no-lean"] });
@@ -313,6 +324,66 @@ async function main() {
           t.perPrompt.map((p, i) => `p${i + 1}(first ${ms(p.firstToken)}, done ${ms(p.total)})`).join(" · ") + "\n"
         );
       }
+      return;
+    }
+
+    case "chat": {
+      // A back-and-forth chat that keeps its OWN conversation per account, so a
+      // direct exchange (e.g. the /openg slash command) never lands in an
+      // unrelated persona thread the way `send`'s "continue most recent" can,
+      // and never spawns a fresh chat every turn. --new resets the thread.
+      need();
+      const message = args.slice(1).join(" ").trim();
+      if (!message) throw new Error('usage: opengpt chat --account <name> "<message>" [--new]');
+
+      const statePath = path.join(AUTH_DIR, `.chat-${account}.json`);
+      let convId = null;
+      if (!opts.new) {
+        try { convId = JSON.parse(fs.readFileSync(statePath, "utf8")).conversationId || null; } catch {}
+      }
+      const sendArgs = {
+        prompts: [message],
+        conversationId: convId,
+        via,
+        system: opts["system-file"] && opts["system-file"] !== true
+          ? readFileSync(opts["system-file"], "utf8")
+          : (opts.system && opts.system !== true ? opts.system : null),
+        timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000,
+      };
+
+      let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);
+      if (!useDaemon && opts.daemon && !opts["no-daemon"]) {
+        await daemon.ensure(account, { lean: !opts["no-lean"] });
+        useDaemon = true;
+      }
+      const run = () => useDaemon
+        ? daemon.request(account, { op: "send", args: sendArgs })
+        : send({ account, ...sendArgs });
+
+      let r;
+      try {
+        r = await run();
+      } catch (e) {
+        // A saved thread can expire (404) — retry once as a fresh chat.
+        if (convId && !opts.new) { sendArgs.conversationId = null; r = await run(); }
+        else throw e;
+      }
+
+      const res = r.results[0] || {};
+      if (res.conversationId) {
+        try {
+          ensureAuthDir();
+          fs.writeFileSync(statePath, JSON.stringify({ conversationId: res.conversationId, updated: new Date().toISOString() }, null, 2));
+          fs.chmodSync(statePath, 0o600);
+        } catch {}
+      }
+
+      if (opts.json) { out({ results: r.results, timings: r.timings }); return; }
+      if (res.text) out(res.text);
+      else if (res.savedPaths?.length) out(res.savedPaths.map((p) => `[image saved] ${p}`).join("\n"));
+      else if (res.images?.length) out(res.images.map((u) => `[image] ${u}`).join("\n"));
+      else out("(no text captured)");
+      if (opts["show-id"] && res.conversationId) process.stderr.write(`[conversation ${res.conversationId}]\n`);
       return;
     }
 
