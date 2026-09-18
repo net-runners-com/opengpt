@@ -225,6 +225,16 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     .waitForFunction((stop) => !document.querySelector(stop), STOP_BTN, { timeout: 15000 })
     .catch(() => {});
 
+  // On a continued chat the existing turns must be painted before we snapshot
+  // the pre-send baselines. On a cold warm page (daemon just started, softNav
+  // has only just routed into /c/<id>) the history is still rendering, so prevN
+  // reads 0 and the completion scan then treats the PREVIOUS answer as this
+  // turn's — the stale first reply. Wait for the prior answer to be on screen.
+  if (/\/c\/[^/?#]/.test(page.url())) {
+    await page.locator('[data-message-author-role="assistant"]').last()
+      .waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  }
+
   // Baselines captured BEFORE sending: turns, the answer already on screen (so
   // a follow-up cannot return it again), and images already in main (an
   // uploaded attachment counts here so it isn't mistaken for a result).
