@@ -128,6 +128,25 @@ function unfence(s) {
 //     and the trailing assistant turn is an invisible code stub)
 // recipient !== "all" means the message is addressed to a tool, i.e. the turn is
 // still mid-flight.
+// Web-search / grounded answers embed citation spans delimited by private-use
+// characters: U+E200 <cite> U+E202 turn0search12 U+E202 … U+E201. The web UI
+// renders them as citation chips; in plain text they read as
+// "citeturn0search12turn0search11". Strip the spans and any stray PUA markers.
+// Such answers also sometimes append an unwrapped nav token on its own line
+// (e.g. "genuigC1t"); drop a trailing isolated gibberish token, but only when
+// citations were actually present, so normal answers are never touched.
+function stripCitations(s) {
+  const hadCite = /[-]/.test(s);
+  let t = s.replace(/[\s\S]*?/g, "").replace(/[-]/g, "");
+  if (hadCite) {
+    const m = t.match(/\n{2,}\s*([^\n]{3,20})\s*$/);
+    if (m && /^[A-Za-z0-9]+$/.test(m[1]) && /[0-9]/.test(m[1]) && /[a-z]/.test(m[1]) && /[A-Z]/.test(m[1])) {
+      t = t.slice(0, m.index);
+    }
+  }
+  return t.trim();
+}
+
 export async function apiAnswer(account, convId, via) {
   const d = await api(account, "GET", `/backend-api/conversation/${convId}`, { via });
   const nodeId = d.current_node;
@@ -156,7 +175,7 @@ export async function apiAnswer(account, convId, via) {
 
   let text = "";
   if (tip.author?.role === "assistant" && tip.content?.content_type === "text" && toUser(tip)) {
-    text = unfence((tip.content.parts || []).filter((p) => typeof p === "string").join("\n").trim());
+    text = stripCitations(unfence((tip.content.parts || []).filter((p) => typeof p === "string").join("\n").trim()));
   }
 
   // Done when the tip says so, or when the tip IS the image-bearing tool turn.
