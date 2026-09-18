@@ -240,7 +240,17 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   // API-side baseline: remember which node was the tip, so a follow-up cannot
   // hand back the previous answer (which is itself "complete").
   let convId = convIdFromUrl(page);
-  const prevNode = convId ? (await apiAnswer(account, convId, via).catch(() => null))?.nodeId ?? null : null;
+  // Pre-send tip: a follow-up must not hand back the previous (already-complete)
+  // answer. This baseline read shares the conversation rate limit, so retry it a
+  // few times — if it stays null on a CONTINUED chat, the API break below would
+  // accept the old tip (null !== any nodeId) and return the stale previous
+  // answer (seen when rapid testing tripped the read limit).
+  const continuing = !!convId;
+  let prevNode = null;
+  for (let i = 0; continuing && i < 3 && prevNode === null; i++) {
+    prevNode = (await apiAnswer(account, convId, via).catch(() => null))?.nodeId ?? null;
+    if (prevNode === null) await new Promise((r) => setTimeout(r, 400));
+  }
   s = now();
 
   // This turn's answer stream. Its closing is the moment the answer is done;
@@ -311,7 +321,7 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   const deadline = Date.now() + timeoutMs;
   let text = "", images = [], lastSig = null, stable = 0;
   let nextApiAt = Date.now() + 6000, apiGap = 1000, closedSeen = false;
-  const read = () => page.evaluate(({ prevN, prevText }) => {
+  const read = () => page.evaluate(({ prevN }) => {
     const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     // When ChatGPT renders an answer as a writing block it appends clickable
     // follow-up suggestions inside the same turn ("もう少し短くする" …). They are
@@ -323,14 +333,16 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
       c.querySelectorAll('[data-testid="writing-block-suggested-followups"]').forEach((n) => n.remove());
       return c.innerText.trim();
     };
+    // Read ONLY assistant turns added by THIS send (index >= prevN). Scanning
+    // older turns let a follow-up fall back to the previous, already-complete
+    // answer while this turn was still empty (thinking) — that read as a stable
+    // result and returned the PREVIOUS answer. Reproduced on the warm daemon
+    // page, where the reply is fast and this DOM path wins over the API poll.
     let text = "";
-    for (let i = as.length - 1; i >= 0; i--) { const v = body(as[i]); if (v) { text = v; break; } }
+    for (let i = as.length - 1; i >= prevN; i--) { const v = body(as[i]); if (v) { text = v; break; } }
     const stop = !!document.querySelector('button[data-testid="stop-button"]');
-    // On a follow-up the previous answer is still the last assistant turn until
-    // the new one renders — don't mistake it for this turn's result.
-    const fresh = as.length > prevN || (!!text && text !== prevText);
-    return { text, stop, fresh };
-  }, { prevN: prev.n, prevText: prev.text });
+    return { text, stop };
+  }, { prevN: prev.n });
 
   while (Date.now() < deadline) {
     // Preferred path: ask the API. It reports the finished text and an explicit
@@ -348,7 +360,11 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
       if (process.env.OPENGPT_DEBUG) {
         process.stderr.write(`[dbg] +${Math.round(now() - s)}ms conv=${convId} node=${a?.nodeId} complete=${a?.complete} imgs=${a?.images?.length}${err ? ` error=${err.message.slice(0, 80)}` : ""}\n`);
       }
-      if (a?.complete && a.nodeId && a.nodeId !== prevNode) {
+      // When the pre-send tip is unknown on a continued chat (baseline read kept
+      // failing), nodeId !== null always holds, so the OLD answer would match.
+      // Reject it with the pre-send text baseline before accepting completion.
+      const stale = continuing && prevNode === null && a?.text && a.text === prev.text;
+      if (a?.complete && a.nodeId && a.nodeId !== prevNode && !stale) {
         text = a.text;
         images = a.images;
         break;
@@ -359,7 +375,7 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     }
 
     const st = await read();
-    text = st.fresh ? st.text : "";
+    text = st.text; // already restricted to this send's own turn(s)
     const hasResult = text.length > 0;
     // Always finish on a quiet period, never on the stop button alone: the
     // button disappears before the last of the text renders on multi-item
