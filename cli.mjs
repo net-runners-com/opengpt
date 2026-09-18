@@ -22,7 +22,7 @@ import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "no-lean"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
-  chat: new Set([...COMMON_BOOLEANS, "json"]),
+  chat: new Set([...COMMON_BOOLEANS, "json", "list"]),
   _default: new Set(COMMON_BOOLEANS),
 };
 
@@ -99,13 +99,14 @@ const HELP = `opengpt — ChatGPT backend-api client
        Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
        /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
 
-  opengpt chat     --account <name> "<message>" [--new]
-       Direct back-and-forth: keeps ONE dedicated conversation per account
-       (stored in the auth dir), so it never lands in an unrelated persona
-       thread and never starts a new chat every turn. --new resets the thread.
+  opengpt chat     --account <name> [--session <name>] "<message>" [--new] | --list
+       Direct back-and-forth. Each --session keeps its OWN ChatGPT thread (work,
+       personal, …); default is one shared thread. --new resets that session's
+       thread; --list shows all sessions with their conversation id. Never lands
+       in an unrelated persona thread and never starts a new chat every turn.
        Uses the daemon when up (--daemon starts one on demand). Prints only the
-       reply. Powers the /openg slash command. Also: --system/-file, --json,
-       --show-id, --no-daemon, --timeout.
+       reply. Powers /openg. Also: --system/-file, --json, --show-id,
+       --no-daemon, --timeout.
 
 Global:  --via auto|node|browser   (read commands; default auto)
          --raw                      print raw response text
@@ -333,10 +334,30 @@ async function main() {
       // unrelated persona thread the way `send`'s "continue most recent" can,
       // and never spawns a fresh chat every turn. --new resets the thread.
       need();
-      const message = args.slice(1).join(" ").trim();
-      if (!message) throw new Error('usage: opengpt chat --account <name> "<message>" [--new]');
+      // Named sessions: each keeps its OWN ChatGPT thread, so several ongoing
+      // conversations run in parallel (work / personal / …). The default session
+      // reuses the legacy state path so existing threads carry over.
+      const session = (opts.session && opts.session !== true ? String(opts.session) : "default")
+        .replace(/[^\w-]/g, "").slice(0, 40) || "default";
+      const stateFile = (sess) => path.join(AUTH_DIR, sess === "default" ? `.chat-${account}.json` : `.chat-${account}-${sess}.json`);
 
-      const statePath = path.join(AUTH_DIR, `.chat-${account}.json`);
+      if (opts.list) {
+        const prefix = `.chat-${account}`;
+        const files = fs.existsSync(AUTH_DIR)
+          ? fs.readdirSync(AUTH_DIR).filter((f) => f === `${prefix}.json` || (f.startsWith(`${prefix}-`) && f.endsWith(".json")))
+          : [];
+        out(files.map((f) => {
+          const name = f === `${prefix}.json` ? "default" : f.slice(prefix.length + 1, -5);
+          let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, f), "utf8")); } catch {}
+          return { session: name, conversationId: d.conversationId || null, updated: d.updated || null };
+        }));
+        return;
+      }
+
+      const message = args.slice(1).join(" ").trim();
+      if (!message) throw new Error('usage: opengpt chat --account <name> [--session <name>] "<message>" [--new]  (or --list)');
+
+      const statePath = stateFile(session);
       let convId = null;
       if (!opts.new) {
         try { convId = JSON.parse(fs.readFileSync(statePath, "utf8")).conversationId || null; } catch {}
