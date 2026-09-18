@@ -327,11 +327,18 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     // follow-up suggestions inside the same turn ("もう少し短くする" …). They are
     // UI, not the answer, so drop them before reading the text.
     const body = (el) => {
+      let raw;
       const sug = el.querySelector('[data-testid="writing-block-suggested-followups"]');
-      if (!sug) return el.innerText.trim();
-      const c = el.cloneNode(true);
-      c.querySelectorAll('[data-testid="writing-block-suggested-followups"]').forEach((n) => n.remove());
-      return c.innerText.trim();
+      if (!sug) raw = el.innerText.trim();
+      else {
+        const c = el.cloneNode(true);
+        c.querySelectorAll('[data-testid="writing-block-suggested-followups"]').forEach((n) => n.remove());
+        raw = c.innerText.trim();
+      }
+      // A reaction affordance ("message_reaction" + 👍/👎) renders inside the turn
+      // for a moment while the answer finalizes and otherwise glues onto the
+      // front of the text. It is UI, never part of the answer, so drop it.
+      return raw.replace(/message_reaction\s*[\u{1F44D}\u{1F44E}]?/gu, "").trim();
     };
     // Read ONLY assistant turns added by THIS send (index >= prevN). Scanning
     // older turns let a follow-up fall back to the previous, already-complete
