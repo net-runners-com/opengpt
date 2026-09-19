@@ -33,9 +33,34 @@ export function cookieHeader(auth) {
     .join("; ");
 }
 
+// When the bearer actually dies (unix seconds). The bearer is a JWT and its own
+// `exp` is what the API enforces. `accessTokenExpires` is the `expires` from
+// /api/auth/session — the SESSION's end (~90 days), not the bearer's (~10
+// days): measured 2026-09-19, session 2026-12-18 vs jwt exp 2026-09-29.
+// Trusting only the session date let a dead bearer through, every conversation
+// read 401'd token_expired, and send sat out its whole 600s timeout.
+export function tokenExpiry(auth) {
+  let jwt = null;
+  try {
+    jwt = JSON.parse(Buffer.from(String(auth.accessToken).split(".")[1], "base64url").toString()).exp || null;
+  } catch {}
+  const session = auth.accessTokenExpires || null;
+  return jwt && session ? Math.min(jwt, session) : jwt || session;
+}
+
 export function isExpired(auth, skewSec = 120) {
-  if (!auth.accessTokenExpires) return true;
-  return Date.now() / 1000 >= auth.accessTokenExpires - skewSec;
+  const exp = tokenExpiry(auth);
+  if (!exp) return true;
+  return Date.now() / 1000 >= exp - skewSec;
+}
+
+// The bearer is dead and could not be re-minted — every API read will 401, so
+// callers should stop instead of polling to their timeout.
+export function authExpiredError(account, why) {
+  return Object.assign(
+    new Error(`auth expired for "${account}" (${why}) — run \`opengpt refresh --account ${account}\`, or \`opengpt login\` if that fails`),
+    { code: "AUTH_EXPIRED" },
+  );
 }
 
 // Ask the page context for /api/auth/session — the browser attaches the

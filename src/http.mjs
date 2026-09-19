@@ -2,18 +2,13 @@
 // Falls back to the browser profile's network stack when Cloudflare blocks
 // the Node client (TLS/JA3 fingerprint), so the same call works either way.
 import { BASE, CLIENT_HEADERS } from "./config.mjs";
-import { cookieHeader, isExpired, refresh, loadAuth } from "./auth.mjs";
+import { cookieHeader, isExpired, refresh, loadAuth, authExpiredError } from "./auth.mjs";
 import { openEphemeral } from "./browser.mjs";
 
 // Auth headers for a hand-rolled fetch (binary downloads, streaming endpoints)
 // where api() below is the wrong shape. Refreshes an expired bearer first.
 export async function authHeaders(account, { via = "auto", extra } = {}) {
-  let auth = loadAuth(account);
-  if (isExpired(auth)) {
-    await refresh(account, { via: via === "node" ? "node" : "auto" });
-    auth = loadAuth(account);
-  }
-  return headersFor(auth, extra);
+  return headersFor(await ensureAuth(account, { via }), extra);
 }
 
 function headersFor(auth, extra = {}) {
@@ -61,22 +56,46 @@ async function browserRequest(auth, method, path, { json, headers } = {}) {
   }
 }
 
+// Make sure the saved bearer is live, re-minting it when it is past its expiry.
+// Throws AUTH_EXPIRED when it cannot be re-minted, so a caller finds out now
+// rather than after a browser launch and a timeout.
+export async function ensureAuth(account, { via = "auto" } = {}) {
+  let auth = loadAuth(account);
+  if (!isExpired(auth)) return auth;
+  try {
+    await refresh(account, { via: via === "node" ? "node" : "auto" });
+  } catch (e) {
+    throw authExpiredError(account, `refresh failed: ${e.message}`);
+  }
+  auth = loadAuth(account);
+  if (isExpired(auth)) throw authExpiredError(account, "refresh returned an already-expired bearer");
+  return auth;
+}
+
 // Main entry: ensure a fresh token, run the request, auto-fallback to browser.
 export async function api(account, method, path, { json, headers, via = "auto", raw = false } = {}) {
-  let auth = loadAuth(account);
-  if (isExpired(auth)) {
-    await refresh(account, { via: via === "node" ? "node" : "auto" });
-    auth = loadAuth(account);
-  }
-  let res;
-  if (via === "browser") {
-    res = await browserRequest(auth, method, path, { json, headers });
-  } else {
-    res = await nodeRequest(auth, method, path, { json, headers });
-    if (res.blocked && via === "auto") {
-      if (process.env.OPENGPT_DEBUG) process.stderr.write(`[dbg] ${method} ${path} → ${res.status} over node; launching a browser to retry\n`);
-      res = await browserRequest(auth, method, path, { json, headers });
+  let auth = await ensureAuth(account, { via });
+  const run = async () => {
+    if (via === "browser") return browserRequest(auth, method, path, { json, headers });
+    let r = await nodeRequest(auth, method, path, { json, headers });
+    if (r.blocked && via === "auto") {
+      if (process.env.OPENGPT_DEBUG) process.stderr.write(`[dbg] ${method} ${path} → ${r.status} over node; launching a browser to retry\n`);
+      r = await browserRequest(auth, method, path, { json, headers });
     }
+    return r;
+  };
+  let res = await run();
+  // 401 on a bearer that looked unexpired (revoked, or signed out elsewhere):
+  // re-mint once and retry; a second 401 means the session itself is gone.
+  if (res.status === 401) {
+    try {
+      await refresh(account, { via: via === "node" ? "node" : "auto" });
+    } catch (e) {
+      throw authExpiredError(account, `401 from ${path}, refresh failed: ${e.message}`);
+    }
+    auth = loadAuth(account);
+    res = await run();
+    if (res.status === 401) throw authExpiredError(account, `401 from ${path} even after refresh: ${res.text.slice(0, 120)}`);
   }
   if (res.status >= 400) {
     const snippet = res.text.slice(0, 300);

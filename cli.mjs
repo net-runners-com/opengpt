@@ -2,7 +2,7 @@
 // opengpt — call the ChatGPT web backend-api directly, reusing a logged-in
 // browser profile for auth. See README.md.
 import { readFileSync } from "node:fs";
-import { login, refresh, loadAuth, listAccounts } from "./src/auth.mjs";
+import { login, refresh, loadAuth, listAccounts, tokenExpiry, isExpired } from "./src/auth.mjs";
 import { api } from "./src/http.mjs";
 import { send } from "./src/send.mjs";
 import {
@@ -51,7 +51,7 @@ const HELP = `opengpt — ChatGPT backend-api client
   opengpt refresh --account <name> [--via auto|node|browser]
        Mint a fresh bearer from the saved session cookie.
 
-  opengpt accounts                       list saved accounts
+  opengpt accounts [--status]            list saved accounts (--status: bearer expiry, offline)
   opengpt whoami   --account <name>      /backend-api/me
   opengpt models   --account <name>      /backend-api/models
   opengpt plan     --account <name>      /backend-api/accounts/check/v4-2023-04-27
@@ -134,7 +134,13 @@ async function main() {
       out(HELP); return;
 
     case "accounts":
-      out(listAccounts()); return;
+      if (!opts.status) { out(listAccounts()); return; }
+      // Offline check of each saved bearer's real (JWT) expiry — no request sent.
+      out(listAccounts().filter((a) => !a.startsWith(".")).map((a) => {
+        const exp = tokenExpiry(loadAuth(a));
+        return { account: a, bearerExpires: exp ? new Date(exp * 1000).toISOString() : null, expired: isExpired(loadAuth(a), 0) };
+      }));
+      return;
 
     case "login": {
       if (!opts.profile) throw new Error("--profile is required");
@@ -419,8 +425,9 @@ async function main() {
       try {
         r = await run();
       } catch (e) {
-        // A saved thread can expire (404) — retry once as a fresh chat.
-        if (convId && !opts.new) { sendArgs.conversationId = null; r = await run(); }
+        // A saved thread can expire (404) — retry once as a fresh chat. A dead
+        // bearer fails the fresh chat the same way, so do not relaunch for it.
+        if (convId && !opts.new && e.code !== "AUTH_EXPIRED") { sendArgs.conversationId = null; r = await run(); }
         else throw e;
       }
 

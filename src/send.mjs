@@ -12,7 +12,7 @@ import path from "node:path";
 import { BASE } from "./config.mjs";
 import { loadAuth, saveAuth } from "./auth.mjs";
 import { openEphemeral } from "./browser.mjs";
-import { api, authHeaders } from "./http.mjs";
+import { api, authHeaders, ensureAuth } from "./http.mjs";
 
 const now = () => performance.now();
 const ASSISTANT = '[data-message-author-role="assistant"]';
@@ -202,6 +202,14 @@ async function downloadAsset(account, fileId, via) {
   return { buf: Buffer.from(await res.arrayBuffer()), name: r.file_name || fileId };
 }
 
+// Swallow a transient API read error (429, a blip) so polling carries on — but
+// not a dead bearer: every later read would 401 too, and an image-gen turn has
+// no DOM text to fall back on, so the loop would silently run to its timeout.
+function fatalOnly(e) {
+  if (e?.code === "AUTH_EXPIRED") throw e;
+  return null;
+}
+
 // Send one prompt on an already-open, ready page. Returns {text, images, conversationId, timings}.
 async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, attach = null, docs = null } = {}) {
   const t = {};
@@ -277,7 +285,7 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
   const continuing = !!convId;
   let prevNode = null;
   for (let i = 0; continuing && i < 3 && prevNode === null; i++) {
-    prevNode = (await apiAnswer(account, convId, via).catch(() => null))?.nodeId ?? null;
+    prevNode = (await apiAnswer(account, convId, via).catch(fatalOnly))?.nodeId ?? null;
     if (prevNode === null) await new Promise((r) => setTimeout(r, 400));
   }
   s = now();
@@ -392,7 +400,7 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
     if (streamClosed && !closedSeen) { closedSeen = true; nextApiAt = 0; }
     if (convId && Date.now() >= nextApiAt) {
       let err = null;
-      const a = await apiAnswer(account, convId, via).catch((e) => { err = e; return null; });
+      const a = await apiAnswer(account, convId, via).catch((e) => { fatalOnly(e); err = e; return null; });
       if (process.env.OPENGPT_DEBUG) {
         process.stderr.write(`[dbg] +${Math.round(now() - s)}ms conv=${convId} node=${a?.nodeId} complete=${a?.complete} imgs=${a?.images?.length}${err ? ` error=${err.message.slice(0, 80)}` : ""}\n`);
       }
@@ -426,7 +434,7 @@ async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, atta
         // (UI artifacts like reactions, follow-up chips). Prefer the API's clean
         // JSON text; keep the scraped text only when the API can't be read (429).
         if (convId) {
-          const a = await apiAnswer(account, convId, via).catch(() => null);
+          const a = await apiAnswer(account, convId, via).catch(fatalOnly);
           const stale = continuing && prevNode === null && a?.text && a.text === prev.text;
           if (a?.complete && a.nodeId && a.nodeId !== prevNode && !stale) { text = a.text; images = a.images; }
         }
@@ -518,6 +526,9 @@ export async function send({
   context: borrowed = null,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
+  // Fail before the browser launch, not at the timeout: the answer is read over
+  // the API, so a bearer that cannot be re-minted makes the whole send useless.
+  await ensureAuth(account, { via });
   const auth = loadAuth(account);
   const timings = { launch: 0, load: 0, perPrompt: [] };
   const frame = (p) => (system ? `${system}\n\n${p}` : p);

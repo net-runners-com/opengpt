@@ -108,6 +108,10 @@ Each `send` pays browser launch (~1.5s) + SPA boot (~3.2s). Two ways around it:
   the canvas title is glued to the first line.
 - `PATCH /backend-api/projects/<gid>` is a full replace of
   name/instructions/emoji/theme; a partial body 422s.
+- The bearer (JWT) dies after ~10 days while the saved session lasts ~90, so
+  expiry is judged from the JWT's own `exp`. `send` re-mints a dead bearer
+  before launching the browser and stops with `AUTH_EXPIRED` if it cannot;
+  `accounts --status` shows each account's bearer expiry offline.
 - Attachment completion is a network fact (a finished `process_upload_stream`
   per file), not a DOM one — the chip renders on selection while bytes are still
   uploading.

@@ -70,7 +70,7 @@ export async function request(account, payload, { timeoutMs = 300000 } = {}) {
       try { msg = JSON.parse(buf.slice(0, nl)); }
       catch (e) { return done(reject, new Error(`bad daemon reply: ${e.message}`)); }
       if (msg.ok) done(resolve, msg.result);
-      else done(reject, new Error(msg.error || "daemon error"));
+      else done(reject, Object.assign(new Error(msg.error || "daemon error"), { code: msg.code }));
     });
     sock.on("error", (e) => done(reject, e));
     sock.write(JSON.stringify(payload) + "\n");
@@ -181,7 +181,7 @@ export async function serve(account, { headed = false, lean = true, idleMs = DEF
         // not a broken page, though: the reload refetches the sidebar history,
         // which is the very limit that tripped, and keeps it tripped.
         if (e.code !== "RATE_LIMITED") sinceReset = RESET_AFTER;
-        sock.end(JSON.stringify({ ok: false, error: e.message }) + "\n");
+        sock.end(JSON.stringify({ ok: false, error: e.message, code: e.code }) + "\n");
       } finally {
         busy = false;
         armIdle();
