@@ -47,9 +47,11 @@ function parse(argv) {
 
 const HELP = `opengpt — ChatGPT backend-api client
 
-  opengpt login   --profile <name|dir> --account <name> [--headed --wait <ms>]
+  opengpt login   --profile <name|dir> --account <name> [--headed] [--wait <ms>]
        Log in via a cloakbrowser profile, save cookies + bearer to auth/<name>.json.
-       A fresh profile needs: --headed --wait 120000  (sign in by hand once).
+       A fresh profile needs: --headed — the window opens, you sign in, and
+       login exits the moment /api/auth/session shows a live bearer (or when
+       you close the window). --wait caps that watch at <ms> (default 10 min).
 
   opengpt refresh --account <name> [--via auto|node|browser]
        Mint a fresh bearer from the saved session cookie.

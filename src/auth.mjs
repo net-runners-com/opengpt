@@ -106,17 +106,43 @@ export async function login({ profile, account, headed = false, waitMs = 0 }) {
   }
 
   return withContext(profileDir, { headed }, async (context) => {
-    if (waitMs > 0) {
-      // Give a human time to complete an interactive sign-in in a headed window.
+    // Headed login = interactive sign-in: default to a generous 10-minute
+    // window and watch the browser so we can exit the moment the user is
+    // either done (live bearer appears) or gives up (window closed). Headless
+    // login = "the cookies on disk are already good" and finishes on the
+    // first poll — no window to close, no reason to wait longer than the
+    // caller asked.
+    const effectiveWait = waitMs || (headed ? 600000 : 0);
+    let closed = false;
+    context.on("close", () => { closed = true; });
+    if (effectiveWait > 0) {
       const page = context.pages()[0] || (await context.newPage());
       await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
-      await page.waitForTimeout(waitMs);
+      if (headed) process.stderr.write(`[login] sign in in the browser window — this will exit as soon as you're in (or when you close the window)\n`);
+      const deadline = Date.now() + effectiveWait;
+      while (!closed && Date.now() < deadline) {
+        const r = await context.request.get(`${BASE}/api/auth/session`, { headers: { accept: "application/json" } }).catch(() => null);
+        const s = r?.ok() ? await r.json().catch(() => null) : null;
+        if (s?.accessToken && !isExpired({ accessToken: s.accessToken }, 0)) break;
+        // Avoid page.waitForTimeout here — a Playwright timer survives a
+        // context close with an "Target page, context or browser has been
+        // closed" rejection, which would race the close listener.
+        await new Promise((r) => setTimeout(r, 2000));
+      }
     }
-    const { status, session, cookies, ua } = await readSessionInBrowser(context);
-    if (!session || !session.accessToken) {
+    // The context is already gone if `closed` fired — reading session via it
+    // would just throw. Try anyway and let the error path below name it.
+    const { status, session, cookies, ua } = closed
+      ? { status: 0, session: null, cookies: [], ua: null }
+      : await readSessionInBrowser(context);
+    if (closed && (!session?.accessToken || isExpired({ accessToken: session.accessToken }, 0))) {
+      throw new Error(`login cancelled — the window was closed on "${profile}" before a session was captured`);
+    }
+    if (!session || !session.accessToken || isExpired({ accessToken: session.accessToken }, 0)) {
       throw new Error(
-        `not logged in on profile "${profile}" (/api/auth/session status ${status}). ` +
-        `Re-run with --headed --wait 120000 and sign in manually.`
+        `not logged in on profile "${profile}" (/api/auth/session status ${status}` +
+        `${session?.accessToken ? ", returned an already-expired bearer" : ""}). ` +
+        `Re-run with --headed and sign in manually.`
       );
     }
     const auth = {
@@ -146,18 +172,29 @@ export async function refresh(account, { via = "auto" } = {}) {
         "user-agent": auth.userAgent || "Mozilla/5.0",
       },
     });
+    // A stale session cookie still answers 200 — with the OLD bearer it last
+    // minted, long dead (measured 2026-09-19: four accounts handed back JWTs
+    // issued 2026-08-25, exp 2026-09-04, next to a fresh session `expires`).
+    // Saving that reported success while every later call 401'd, so a bearer
+    // is only accepted when its own exp is still ahead.
+    let stale = false;
     if (r.ok) {
       const s = await r.json().catch(() => ({}));
-      if (s.accessToken) {
+      if (s.accessToken && isExpired({ accessToken: s.accessToken }, 0)) stale = true;
+      else if (s.accessToken) {
         auth.accessToken = s.accessToken;
         auth.accessTokenExpires = s.expires ? Math.floor(new Date(s.expires).getTime() / 1000) : auth.accessTokenExpires;
         auth.user = s.user || auth.user;
         auth.savedAt = new Date().toISOString();
         saveAuth(account, auth);
-        return { via: "node", expires: s.expires };
+        return { via: "node", expires: new Date(tokenExpiry(auth) * 1000).toISOString() };
       }
     }
-    if (via === "node") throw new Error(`refresh via node failed (status ${r.status}); Cloudflare likely blocked it. Try --via browser.`);
+    if (via === "node") {
+      throw new Error(stale
+        ? "refresh via node got back an already-expired bearer (the saved session cookie is stale). Try --via browser, or log in again."
+        : `refresh via node failed (status ${r.status}); Cloudflare likely blocked it. Try --via browser.`);
+    }
   }
   // browser fallback re-runs login against the saved profile
   const out = await login({ profile: auth.profile, account, headed: false });
