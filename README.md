@@ -306,6 +306,50 @@ project has no chats yet.
 `--show-id` prints each conversation id to stderr, `--json` returns it per
 result, and `project chats <gid>` lists every conversation in the project.
 
+## Back-and-forth chat (`chat`)
+
+A per-account named-session wrapper around `send` for interactive use — each
+session keeps its own ChatGPT conversation on disk, so parallel threads (work,
+personal, …) don't collide and a direct exchange never lands in whatever
+"most recent" thread `send` would otherwise continue.
+
+```bash
+# default session (one shared thread per account)
+opengpt chat --account me "今日の予定を3つ"
+opengpt chat --account me "最後のやつ、もう少し詳しく"   # continues the same thread
+
+# named sessions — each has its own thread
+opengpt chat --account me --session work "週報の下書き"
+opengpt chat --account me --session personal "ジムの進捗まとめて"
+
+# reset a session to a fresh thread
+opengpt chat --account me --session work --new "新しいお題"
+
+# list every session you have and the thread each one points at
+opengpt chat --account me --list
+
+# compact: summarise the session's current thread, start a new one seeded with
+# the summary, re-point the session at it. Context kept, growth reset.
+opengpt chat --account me --session work --compact
+opengpt chat --account me --session work --compact "次はこれ"   # also sends a first message
+```
+
+Session state lives in `auth/.chat-<account>[-<session>].json` (`chmod 600`).
+
+The `/openg` slash command in `commands/openg.md` is a thin wrapper over this:
+`<message> [--session <name>] [--new]` prints only ChatGPT's reply.
+
+## Accounts
+
+```bash
+opengpt accounts            # list every saved account
+opengpt accounts --status   # per-account bearer status (fresh / expired / dies in Nd)
+```
+
+Each `<account>` names one `auth/<account>.json` blob. First-time setup is one
+`opengpt login --profile <name> --account <account> --headed`; after that every
+command takes `--account <name>`.
+
 ## Driving ChatGPT as a worker (orchestration)
 
 ChatGPT can't host Claude Code skills/MCP — it only runs its own side. The model

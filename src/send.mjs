@@ -174,8 +174,10 @@ async function mintSentinelTokens(headers, ua) {
 
 // ── 3. Reading the finished turn ─────────────────────────────────────────────
 //
-// `apiAnswer` is pure HTTP already. Kept exported because the daemon reads
-// conversation history through it. See send-side notes for the delicate parts.
+// `apiAnswer` is pure HTTP. Exported for scripting (read a finished turn's
+// text + images outside of send). The send flow itself calls it internally
+// twice per turn: once to resolve `parent_message_id` for continuations, and
+// once at the end to pick up the clean final text.
 
 // Writing-block answers come fenced; this is presentation, not content.
 const WRITING_FENCE = /^:::writing\{[^}]*\}\s*\n([\s\S]*?)\n?:::\s*$/;
