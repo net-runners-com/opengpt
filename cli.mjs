@@ -321,10 +321,18 @@ async function main() {
       }
       if (opts.time) {
         const t = r.timings;
-        const ms = (v) => `${Math.round(v)}ms`;
+        const ms = (v) => (v == null ? "—" : `${Math.round(v)}ms`);
+        // The pure-HTTP send doesn't launch a browser or boot an SPA, so the
+        // per-prompt shape carries the real work: sentinel mint, first SSE
+        // byte, and the full stream to end-of-turn.
         process.stderr.write(
-          `\n[timing] launch ${ms(t.launch)} · load ${ms(t.load)} · ` +
-          t.perPrompt.map((p, i) => `p${i + 1}(first ${ms(p.firstToken)}, done ${ms(p.total)})`).join(" · ") + "\n"
+          `\n[timing]` +
+          (t.uploads ? ` uploads ${t.uploads} ·` : "") +
+          " " +
+          t.perPrompt.map((p, i) =>
+            `p${i + 1}(sentinel ${ms(p.sentinel)}, first ${ms(p.firstToken)}, stream ${ms(p.stream)}` +
+            (p.powIter != null ? `, pow ${p.powIter}iter/${ms(p.powMs)}` : "") + ")"
+          ).join(" · ") + "\n"
         );
       }
       return;
