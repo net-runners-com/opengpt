@@ -1,25 +1,16 @@
-// A local daemon that keeps one warm browser context, so `send` stops paying
-// browser launch + SPA boot on every invocation.
+// A local daemon that fronts `send` over a Unix socket. Historically this
+// held a warm browser so composer-driven sends skipped SPA boot; the pure-HTTP
+// rewrite dropped the browser altogether (2026-10-15), so the daemon is now
+// just a per-account single-flight gate — one send at a time, no overlap on
+// the sentinel token mint — plus a place to add short-lived caches later.
 //
-// Measured cost of a cold send: launch ~1.5s + first page load ~3.2s. A warm
-// browser with a FRESH context still pays ~3.0s to boot the SPA again, so the
-// win only appears when the PAGE is reused and navigation happens in-page
-// (~50ms). That is what this holds open.
-//
-// Deliberately NOT a TCP port: a live authenticated ChatGPT session behind
-// localhost:NNNN is usable by anything on the machine. A Unix socket with 0600
-// is reachable only by this user.
-//
-// One browser, one page, one request at a time — the warm page is shared state,
-// so requests to the daemon serialize.
+// Still a Unix socket, 0600: a live authenticated ChatGPT session behind
+// localhost:NNNN would be usable by anything on the machine.
 import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadAuth } from "./auth.mjs";
-import { openEphemeral } from "./browser.mjs";
 import { send } from "./send.mjs";
-import { BASE } from "./config.mjs";
 
 // Unix socket paths are capped near 104 bytes on macOS, so keep this short and
 // out of the deep plugin-data path.
@@ -27,10 +18,9 @@ export function socketPath(account) {
   return path.join(os.tmpdir(), `opengpt-${account}.sock`);
 }
 
-const RESET_AFTER = Number(process.env.OPENGPT_DAEMON_RESET_AFTER || 20);
-// Idle life. A daemon that never exits holds ~0.9GB forever; one that exits
-// when you stop working costs nothing between bursts. Override with --idle,
-// 0 disables.
+// Idle life. The pure-HTTP daemon costs almost nothing idle, but keeping the
+// socket indefinitely is still worse than letting it expire — surprise
+// permissions on a shared machine, etc. 0 disables.
 export const DEFAULT_IDLE_MS = Number(process.env.OPENGPT_DAEMON_IDLE || 300) * 1000;
 
 function connect(account) {
@@ -110,34 +100,18 @@ export async function status(account) {
 }
 
 // Run the daemon. Resolves when it shuts down.
-export async function serve(account, { headed = false, lean = true, idleMs = DEFAULT_IDLE_MS } = {}) {
+// `headed` and `lean` are kept for signature compatibility with the old CLI
+// `daemon start` command — they used to control the browser launch; now they
+// have no effect.
+export async function serve(account, { headed, lean, idleMs = DEFAULT_IDLE_MS } = {}) {
   const sockPath = socketPath(account);
   if (await isRunning(account)) throw new Error(`a daemon is already running for "${account}"`);
   fs.rmSync(sockPath, { force: true });
 
-  const auth = loadAuth(account);
   const started = Date.now();
-  let context = await openEphemeral(auth, { headed, lean });
-  let page = context.pages()[0] || (await context.newPage());
-  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.locator("#prompt-textarea").first().waitFor({ state: "visible", timeout: 30000 });
-
   let served = 0;
-  let sinceReset = 0;
   let busy = false;
   let idleTimer = null;
-
-  // The page accumulates state across sends — a writing block leaves a second
-  // contenteditable behind, long threads re-mount the composer. Reload every
-  // so often so a warm page cannot drift indefinitely.
-  async function resetIfStale() {
-    if (sinceReset < RESET_AFTER) return;
-    sinceReset = 0;
-    try {
-      await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.locator("#prompt-textarea").first().waitFor({ state: "visible", timeout: 30000 });
-    } catch { /* the next send will fall back to a full goto anyway */ }
-  }
 
   const server = net.createServer((sock) => {
     let buf = "";
@@ -172,15 +146,13 @@ export async function serve(account, { headed = false, lean = true, idleMs = DEF
       busy = true;
       if (idleTimer) clearTimeout(idleTimer);
       try {
-        await resetIfStale();
-        const result = await send({ ...req.args, account, context });
-        served++; sinceReset++;
+        // The pure-HTTP send is self-contained; the daemon is just a
+        // single-flight gate so parallel bursts don't race on the sentinel
+        // mint. Any `context` the caller passes is ignored.
+        const result = await send({ ...req.args, account });
+        served++;
         sock.end(JSON.stringify({ ok: true, result }) + "\n");
       } catch (e) {
-        // A broken page should not poison every later request. A rate limit is
-        // not a broken page, though: the reload refetches the sidebar history,
-        // which is the very limit that tripped, and keeps it tripped.
-        if (e.code !== "RATE_LIMITED") sinceReset = RESET_AFTER;
         sock.end(JSON.stringify({ ok: false, error: e.message, code: e.code }) + "\n");
       } finally {
         busy = false;
@@ -204,7 +176,6 @@ export async function serve(account, { headed = false, lean = true, idleMs = DEF
       if (idleTimer) clearTimeout(idleTimer);
       server.close();
       fs.rmSync(sockPath, { force: true });
-      await context.close().catch(() => {});
     })();
     return shuttingDown;
   }

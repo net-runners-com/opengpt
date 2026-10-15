@@ -19,7 +19,10 @@ import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 // swallows the prompt as the flag's value and it is never sent. Per-command,
 // because --json is a boolean on `send` (structured output) but carries the
 // request body on `api`.
-const COMMON_BOOLEANS = ["headed", "lean", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "no-lean"];
+// `headed` is kept for `login` (interactive sign-in). `lean` / `no-lean` were
+// browser-only flags from the old composer-driven send; the pure-HTTP rewrite
+// (2026-10-15) made them meaningless, so they're dropped.
+const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   chat: new Set([...COMMON_BOOLEANS, "json", "list", "compact"]),
@@ -71,14 +74,14 @@ const HELP = `opengpt — ChatGPT backend-api client
        move   <conversation-id> <gid|none>   move a chat in (or out with none)
        --memory default = shared with global memory · project = project-only memory
 
-  opengpt daemon   --account <name> start|stop|status [--idle <sec>] [--headed] [--no-lean]
-       Keep one warm browser so send skips launch + SPA boot (~4.7s -> ~0.04s).
-       Exits after 300s idle by default (--idle 0 = never), so the ~0.9GB it
-       holds comes back when you stop working.
+  opengpt daemon   --account <name> start|stop|status [--idle <sec>]
+       A per-account single-flight gate on a Unix socket. send uses it when
+       up so parallel bursts don't race on the sentinel token mint. Exits
+       after 300s idle by default (--idle 0 = never); costs almost nothing.
        send uses it automatically when it is up; --no-daemon opts out.
 
   opengpt send     --account <name> "<p1>" ["<p2>" ...]
-       Sends one or more prompts. Multiple prompts share ONE warm browser.
+       Sends one or more prompts over pure HTTP (no browser).
        Continues the most recent chat by default (scoped to --project when
        given); --new starts a fresh one. With several prompts, --same-chat
        keeps them in one conversation instead of a chat each.
@@ -87,8 +90,8 @@ const HELP = `opengpt — ChatGPT backend-api client
          --system-file <path>   ...read the instructions from a file (e.g. a skill)
          --conversation <id>    continue one specific thread
          --new                  start a fresh chat instead of continuing
-         --daemon               start a warm daemon on demand (auto-exits when idle)
-         --no-daemon            launch a private browser even if a daemon is up
+         --daemon               start a serializing daemon on demand (auto-exits when idle)
+         --no-daemon            send directly instead of through a running daemon
          --gpt <gizmo-id>       route to a specific Custom GPT
          --project <g-p-id>     start the chat inside a project
          --json                 structured output: [{text, images, conversationId}] + timings
@@ -96,8 +99,7 @@ const HELP = `opengpt — ChatGPT backend-api client
          --save-images <dir>    download generated images (image-gen results) to <dir>
          --image <path[,...]>   upload image file(s) with the prompt (vision / edit)
          --file <path[,...]>    attach document(s) to the chat (pdf/txt/csv/docx/…)
-       Also: --same-chat --headed --lean --time. NOTE: send must use the browser —
-       /f/conversation is gated by Cloudflare Turnstile + proof-of-work.
+       Also: --same-chat --time.
 
   opengpt chat     --account <name> [--session <name>] "<message>" [--new] | --list | --compact
        Direct back-and-forth. Each --session keeps its OWN ChatGPT thread (work,
@@ -249,11 +251,7 @@ async function main() {
       if (sub === "stop")   { out(await daemon.stop(account)); return; }
       if (sub === "start") {
         const idleMs = opts.idle && opts.idle !== true ? Number(opts.idle) * 1000 : daemon.DEFAULT_IDLE_MS;
-        const d = await daemon.serve(account, {
-          headed: !!opts.headed,
-          lean: !opts["no-lean"],   // lean by default: ~0.9GB instead of ~1.2GB
-          idleMs,
-        });
+        const d = await daemon.serve(account, { idleMs });
         process.stderr.write(
           `daemon up · account ${account} · pid ${d.pid} · ${d.socket}` +
           (idleMs ? ` · idle stop after ${idleMs / 1000}s` : "") +
@@ -283,30 +281,24 @@ async function main() {
       }
       const sendArgs = {
         prompts,
-        headed: !!opts.headed,
-        lean: !!opts.lean,             // blocks images/fonts/ads (bandwidth, not latency)
         sameChat: !!opts["same-chat"],
         system,                        // prepend instructions (e.g. a skill's text)
         conversationId,
         via,                           // how the answer is read back over HTTP
-        // --project is the same navigation as --gpt: /g/<id> resolves a
-        // project (g-p-…) as well as a Custom GPT.
+        // --project and --gpt both land here: body-only routing with
+        // conversation_mode.kind = "gizmo_interaction".
         gizmo,
         saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)
         timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more
       };
-      // Hand the work to the daemon when one is up: it owns a warm page, so
-      // this skips browser launch + SPA boot entirely. Falling back on a
-      // daemon-side failure would launch a second browser and risk a duplicate
-      // send, so let the error surface instead.
-      // Use a daemon when one is up. --daemon also starts one on demand: it
-      // exits on its idle timer, so the memory comes back when you stop working
-      // instead of being held forever.
+      // Route through a running daemon so parallel bursts serialize on one
+      // sentinel token mint. --daemon starts one on demand (it auto-exits
+      // when idle); --no-daemon sends directly.
       let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);
       if (!useDaemon && opts.daemon && !opts["no-daemon"]) {
-        await daemon.ensure(account, { lean: !opts["no-lean"] });
+        await daemon.ensure(account);
         useDaemon = true;
       }
       const r = useDaemon
@@ -380,7 +372,7 @@ async function main() {
         if (!convId) throw new Error(`no thread to compact for session "${session}" — send something first`);
         const runSend = async (a) => {
           let useD = !opts["no-daemon"] && await daemon.isRunning(account);
-          if (!useD && opts.daemon && !opts["no-daemon"]) { await daemon.ensure(account, { lean: !opts["no-lean"] }); useD = true; }
+          if (!useD && opts.daemon && !opts["no-daemon"]) { await daemon.ensure(account); useD = true; }
           return useD ? daemon.request(account, { op: "send", args: a }) : send({ account, ...a });
         };
         const sumPrompt = "これまでの会話の要点・前提・決定事項・私について覚えておくべきことを、簡潔な箇条書きで日本語でまとめてください。以後もこれを前提に会話を続けられるように。";
@@ -414,7 +406,7 @@ async function main() {
 
       let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);
       if (!useDaemon && opts.daemon && !opts["no-daemon"]) {
-        await daemon.ensure(account, { lean: !opts["no-lean"] });
+        await daemon.ensure(account);
         useDaemon = true;
       }
       const run = () => useDaemon

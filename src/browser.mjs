@@ -1,6 +1,14 @@
-// Thin cloakbrowser wrapper. The browser is used for exactly two things:
-//   1. login  — as a cookie jar + Cloudflare-passing TLS stack to mint auth
-//   2. send   — to obtain the sentinel / turnstile tokens the page computes
+// Thin cloakbrowser wrapper. Historically this backed `send` by driving the
+// composer; the pure-HTTP rewrite dropped that path (2026-10-15), so the
+// browser is now used for exactly two things:
+//   1. login            — interactive sign-in into a persistent profile, to
+//                         produce the cookie jar and bearer the HTTP flow
+//                         replays from (see auth.mjs: login / refresh).
+//   2. http.mjs fallback — a non-persistent context seeded with saved cookies,
+//                         used when the Node fetch client hits a Cloudflare
+//                         challenge and we need the browser's TLS stack. In
+//                         practice this almost never fires on this account's
+//                         current pool, but it's the last-resort escape hatch.
 // Everything else is plain Node HTTP.
 import { launchPersistentContext, launchContext } from "cloakbrowser";
 import fs from "node:fs";
@@ -36,30 +44,9 @@ function assertProfileFree(profileDir) {
   }
 }
 
-// Hosts that must NEVER be blocked: the app, its APIs, and — critically — the
-// Cloudflare challenge widget that mints the turnstile token. Blocking any of
-// these breaks the legitimate token flow.
-const KEEP_HOST = /(^|\.)(chatgpt\.com|openai\.com|oaistatic\.com|oaiusercontent\.com|cloudflare\.com|challenges\.cloudflare\.com)$/;
-
-// Pure telemetry / ads seen in the traces — safe to drop, never functional.
-const DROP_HOST = /(^|\.)(google-analytics\.com|googletagmanager\.com|doubleclick\.net|googleadservices\.com|google\.com\/(ads|pagead)|linkedin\.com|ads\.linkedin\.com|bing\.com|bat\.bing\.com|tiktok\.com|analytics\.tiktok\.com|sentry\.io|segment\.(io|com))$/;
-
-// Resource types that never affect the send flow — images, media, fonts.
-const DROP_TYPE = new Set(["image", "media", "font"]);
-
-// Cut the ~30MB / ~1800-request cold load down to app JS + API + challenge.
-export async function blockAssets(context) {
-  await context.route("**/*", (route) => {
-    const req = route.request();
-    let host = "";
-    try { host = new URL(req.url()).hostname; } catch {}
-    if (KEEP_HOST.test(host)) return route.continue();
-    if (DROP_HOST.test(host) || DROP_TYPE.has(req.resourceType())) return route.abort();
-    return route.continue();
-  });
-}
-
-export async function openContext(profileDir, { headed = false, lean = false } = {}) {
+// Persistent profile — login's cookie jar and bearer source. Headed is only
+// meaningful here (login's --headed shows a window the user can sign in in).
+export async function openContext(profileDir, { headed = false } = {}) {
   if (!profileDir) throw new Error("a --profile is required for browser operations");
   assertProfileFree(profileDir);
   const context = await launchPersistentContext({
@@ -70,7 +57,6 @@ export async function openContext(profileDir, { headed = false, lean = false } =
     // Do not let Playwright's SIGINT handler kill us mid-flush.
     launchOptions: { handleSIGINT: false, handleSIGTERM: false },
   });
-  if (lean) await blockAssets(context);
   return context;
 }
 
@@ -83,11 +69,10 @@ export async function withContext(profileDir, opts, fn) {
   }
 }
 
-// Non-persistent context seeded with saved cookies. There is NO userDataDir, so
-// there is NO profile SingletonLock — many of these can run at once, even for
-// the same account. Used for send and the HTTP browser-fallback; `login` still
-// needs the persistent profile to do the interactive sign-in.
-export async function openEphemeral(auth, { headed = false, lean = false } = {}) {
+// Non-persistent context seeded with saved cookies — no userDataDir, no lock,
+// many can run at once for the same account. Used by http.mjs when Cloudflare
+// blocks pure Node and we need the browser's TLS stack for one request.
+export async function openEphemeral(auth, { headed = false } = {}) {
   const context = await launchContext({
     headless: !headed,
     locale: "ja-JP",
@@ -95,6 +80,5 @@ export async function openEphemeral(auth, { headed = false, lean = false } = {})
     launchOptions: { handleSIGINT: false, handleSIGTERM: false },
     contextOptions: { storageState: { cookies: auth.cookies || [], origins: [] } },
   });
-  if (lean) await blockAssets(context);
   return context;
 }

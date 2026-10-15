@@ -1,143 +1,190 @@
-// Sending a prompt is the ONE thing pure HTTP cannot do: POST /backend-api/
-// f/conversation requires openai-sentinel-proof-token (proof-of-work) and
-// openai-sentinel-turnstile-token (Cloudflare Turnstile), both computed by the
-// page's obfuscated JS. This does NOT bypass them — it lets the real logged-in
-// page mint them by driving the composer, then reads the streamed answer.
+// Send a prompt to ChatGPT purely over HTTP — no browser.
 //
-// Orchestration: `system` prepends instructions (e.g. a selected Claude Code
-// skill), each result carries its conversationId so a caller can continue a
-// thread (`conversationId` input), and `gizmo` routes to a specific Custom GPT.
+// How a real client turn fires (reverse-engineered from webtrace 2026-10-15):
+//   1. POST /backend-api/sentinel/chat-requirements/prepare {p:"gAAAAAC"+b64(fp)+"~F"}
+//                                → {prepare_token, proofofwork:{seed,difficulty}, …}
+//   2. solve PoW locally         → proof-token (gAAAAAB + b64(cfg) + ~S)
+//   3. POST /backend-api/sentinel/chat-requirements/finalize
+//        {prepare_token, proofofwork:<proof-token>, turnstile:"<anything>"}
+//                                → {token (chat-requirements-token), expire_after:540}
+//   4. POST /backend-api/f/conversation/prepare  (same body as the send below)
+//                                → {status:"ok", conduit_token}  (conduit is cosmetic)
+//   5. POST /backend-api/f/conversation  (sentinel headers + body)
+//                                → text/event-stream delta patches
+//
+// Enforcement, measured:
+//   * PoW:        enforced. Must solve `seed`/`difficulty` from step 1.
+//   * Turnstile:  advertised required, NOT enforced. Any string works.
+//   * `so`:       advertised required, NOT enforced. Omit entirely.
+//   * CF cookies: NOT enforced on free accounts. Session-token.* is enough.
+//
+// SSE delta_encoding v1 is incremental JSON patches. We don't rebuild from
+// patches — we just watch for `conversation_id` and `is_complete`, then GET
+// /backend-api/conversation/<id> for the clean final text + any image parts.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { BASE } from "./config.mjs";
-import { loadAuth, saveAuth } from "./auth.mjs";
-import { openEphemeral } from "./browser.mjs";
+import { loadAuth, saveAuth, cookieHeader, authExpiredError } from "./auth.mjs";
 import { api, authHeaders, ensureAuth } from "./http.mjs";
+import { refresh as refreshAuth } from "./auth.mjs";
 
 const now = () => performance.now();
-const ASSISTANT = '[data-message-author-role="assistant"]';
-// A model turn is either an assistant message or a tool message (image gen and
-// other tool output arrive as role="tool").
-const TURN = '[data-message-author-role="assistant"], [data-message-author-role="tool"]';
-const STOP_BTN = 'button[data-testid="stop-button"]';
-const RATE_LIMIT_MODAL = '[data-testid="modal-conversation-history-rate-limit"]';
-const LOGGED_OUT = '#modal-no-auth-login, [data-testid="login-button"]';
-// Only exists once the composer has text — the fallback for a swallowed Enter.
-const SEND_BTN = 'button[data-testid="send-button"], #composer-submit-button';
-
-// The prompt box is #prompt-textarea. Do NOT reach for it with a comma
-// selector: a conversation that rendered an answer as a writing block has a
-// SECOND contenteditable — the canvas editor — and it comes first in DOM order,
-// so `.first()` types the prompt into the canvas and the send never happens.
-async function readyComposer(page) {
-  const composer = page.locator("#prompt-textarea").first();
-  try {
-    await composer.waitFor({ state: "visible", timeout: 20000 });
-    return composer;
-  } catch {
-    // Older/alternate layouts: any contenteditable inside the composer form.
-    const alt = page.locator('form div[contenteditable="true"]').first();
-    await alt.waitFor({ state: "visible", timeout: 10000 });
-    return alt;
-  }
-}
-
-// The conversation id lives in the URL as /c/<id> once a turn starts — but
-// while the turn is in flight the SPA parks a PLACEHOLDER there, "WEB:<uuid>".
-// The API rejects that with 400 ("Invalid conversation WEB:…") and answers a
-// burst of retries with 429, so only a real uuid counts.
+const uuid = () => crypto.randomUUID();
+const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function convIdFromUrl(page) {
-  const m = /\/c\/([^/?#]+)/.exec(page.url());
-  return m && UUID.test(m[1]) ? m[1] : null;
+
+// ── 1. Proof-of-work ─────────────────────────────────────────────────────────
+//
+// 25-element config array; element 0 is the nonce the solver iterates. The
+// server hashes seed + base64(JSON(array)) with SHA3-512 and compares the hex
+// prefix to the difficulty string. Lower-or-equal wins. Difficulty "07a120"
+// typically settles in <100 iterations because `3424.5` and the ms timestamp
+// at index 17 vary with the browser's performance.now; here we vary only the
+// nonce and let the one-shot timestamps do the rest.
+function proofConfig(nonce, { ua, sid, dateStr, tsMs, perfMs = 3424.5 }) {
+  return [
+    nonce,
+    dateStr,
+    4294967296,
+    53,
+    ua,
+    "https://chatgpt.com/cdn-cgi/challenge-platform/scripts/jsd/api.js?onload=jsdOnload",
+    "35feeb1b19497fee44ca7964f47ec8f571d87a70",
+    "ja", "ja,en-US,en",
+    2,
+    "cookieEnabled−true",
+    "location",
+    "onsecuritypolicyviolation",
+    perfMs,
+    sid,
+    "",
+    8,
+    tsMs,
+    0, 0, 0, 0, 0, 0, 0,
+  ];
 }
 
-// Attach file(s) to the composer.
-//
-// Two inputs: #upload-files takes anything (accept=null), the photo input only
-// image/*. Images go through the photo input because that is what produces an
-// image attachment rather than a document.
-//
-// Completion is a NETWORK fact, not a DOM one. The chip or thumbnail renders
-// the instant the file is *selected* (~0.6s) while the bytes are still going up
-// — on a 4.7 MB txt, POST /backend-api/files fired at 11.1s and
-// process_upload_stream at 12.4s — and no spinner or disabled send button ever
-// appears. Submitting on the chip silently drops the attachment, so wait for
-// one finished process_upload_stream per file, with the old thumbnail check
-// kept only as a fallback for uploads that never stream.
-const PHOTO_INPUT = 'input[data-testid="upload-photos-input"], input[type="file"][accept="image/*"]';
-const ANY_INPUT = "#upload-files";
-
-async function attachFiles(page, files, { images = false, timeoutMs }) {
-  const uploads = [];
-  const onResp = (r) => {
-    if (/\/backend-api\/files\/process_upload_stream/.test(r.url())) {
-      uploads.push(r.finished().catch(() => {}));
+function solvePow({ seed, difficulty }, ctx, maxIter = 2_000_000) {
+  const t0 = Date.now();
+  for (let n = 0; n < maxIter; n++) {
+    const buf = b64(proofConfig(n, ctx));
+    const h = crypto.createHash("sha3-512").update(seed + buf).digest("hex");
+    if (h.slice(0, difficulty.length) <= difficulty) {
+      return { token: "gAAAAAB" + buf + "~S", iterations: n, ms: Date.now() - t0 };
     }
-  };
-  page.on("response", onResp);
-  try {
-    await page.locator(images ? PHOTO_INPUT : ANY_INPUT).first().setInputFiles(files);
-    const deadline = Date.now() + timeoutMs;
-    while (uploads.length < files.length && Date.now() < deadline) await page.waitForTimeout(200);
-    if (uploads.length >= files.length) {
-      await Promise.all(uploads);
-      return;
-    }
-    if (!images) throw new Error(`file upload did not finish (${uploads.length}/${files.length} processed)`);
-    // Images: some uploads settle without a process_upload_stream. Fall back to
-    // the rendered preview, which at least proves the client accepted them.
-    await page.waitForFunction(
-      (n) => {
-        if (document.querySelector('[role="progressbar"], .animate-spin, svg.animate-spin')) return false;
-        return [...document.querySelectorAll("img")].filter((im) => /blob:|oaiusercontent|estuary/.test(im.src)).length >= n;
-      },
-      files.length,
-      { timeout: 30000 },
-    );
-  } finally {
-    page.off("response", onResp);
   }
+  throw new Error(`PoW: no solution in ${maxIter} iterations (difficulty=${difficulty})`);
 }
 
-// ── the answer, read from the API rather than the page ──────────────────────
+// The "p" field posted to /prepare is NOT PoW — it's a client-side fingerprint
+// snapshot the server reads before deciding what to challenge. Shape mirrors
+// the real client; most values are decorative. We signal "no PoW yet" with the
+// gAAAAAC prefix and ~F suffix.
+function prepareFingerprint({ ua, sid, dateStr, tsMs }) {
+  const arr = [
+    2340, dateStr, 4294967296, 1, ua,
+    null,
+    "35feeb1b19497fee44ca7964f47ec8f571d87a70",
+    "ja", "ja,en-US,en",
+    0.5,
+    "vibrate−function vibrate() { [native code] }",
+    "location",
+    "structuredClone",
+    1672.4,
+    sid, "",
+    8, tsMs,
+    0, 0, 0, 0, 0, 0, 0,
+  ];
+  return "gAAAAAC" + b64(arr) + "~F";
+}
+
+// ── 2. Shared request plumbing ───────────────────────────────────────────────
+
+// Everything the real client echoes on each turn. Only `authorization`, cookie
+// and the sentinel-* headers actually gate the call; the rest keeps our shape
+// looking like a real browser so a future tightening doesn't catch us flat.
+function baseHeaders(auth, accountId) {
+  return {
+    accept: "*/*",
+    "accept-language": "ja,en-US;q=0.9,en;q=0.8",
+    authorization: `Bearer ${auth.accessToken}`,
+    "chatgpt-account-id": accountId,
+    "content-type": "application/json",
+    cookie: cookieHeader(auth),
+    "oai-did": "7216aa40-4372-4128-a699-6e8f1276fccb",
+    "oai-echo-logs": "",
+    "oai-language": "ja-JP",
+    origin: BASE,
+    originator: "Codex Browser",
+    priority: "u=1, i",
+    referer: `${BASE}/`,
+    "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": auth.userAgent || "Mozilla/5.0",
+    "x-oai-mcp-form-version": "2",
+    "x-openai-codex-window-type": "browser",
+    "x-openai-web-frontend": "codex_webview",
+    "x-openai-web-sse-compression": "gzip",
+  };
+}
+
+// /backend-api/accounts/check gives the chatgpt-account-id — the request lands
+// at the right pool thanks to this header. We cache onto the auth blob so we
+// only pay the round-trip once per session; the id doesn't rotate.
+async function resolveAccountId(account, auth) {
+  if (auth._accountId) return auth._accountId;
+  const r = await api(account, "GET", "/backend-api/accounts/check/v4-2023-04-27", { via: "node" });
+  const id = Object.keys(r?.accounts || {})[0];
+  if (!id) throw new Error("could not resolve chatgpt-account-id");
+  auth._accountId = id;
+  saveAuth(account, auth);
+  return id;
+}
+
+// Mint a chat-requirements token the backend will accept on /f/conversation.
+// Returns {chatRequirementsToken, proofToken} — a disposable pair, good for a
+// handful of seconds; the server lets a token age up to 540s (expire_after).
+async function mintSentinelTokens(headers, ua) {
+  const sid = uuid();
+  const dateStr = new Date().toString();
+  const tsMs = Date.now() + 0.7;
+  const prepRes = await fetch(`${BASE}/backend-api/sentinel/chat-requirements/prepare`, {
+    method: "POST", headers,
+    body: JSON.stringify({ p: prepareFingerprint({ ua, sid, dateStr, tsMs }) }),
+  });
+  if (!prepRes.ok) throw new Error(`sentinel/prepare → ${prepRes.status}: ${(await prepRes.text()).slice(0, 240)}`);
+  const prep = await prepRes.json();
+  const proof = solvePow(prep.proofofwork, { ua, sid, dateStr, tsMs });
+  const finRes = await fetch(`${BASE}/backend-api/sentinel/chat-requirements/finalize`, {
+    method: "POST", headers,
+    body: JSON.stringify({
+      prepare_token: prep.prepare_token,
+      proofofwork: proof.token,
+      turnstile: "n/a",
+    }),
+  });
+  if (!finRes.ok) throw new Error(`sentinel/finalize → ${finRes.status}: ${(await finRes.text()).slice(0, 240)}`);
+  const fin = await finRes.json();
+  return { chatRequirementsToken: fin.token, proofToken: proof.token, powMs: proof.ms, powIter: proof.iterations };
+}
+
+// ── 3. Reading the finished turn ─────────────────────────────────────────────
 //
-// The DOM is a poor source for the text: an answer rendered as a writing block
-// carries the canvas title and the follow-up suggestion chips in the same turn,
-// and the text keeps rendering after the stop button is gone. GET
-// /backend-api/conversation/<id> has the real thing — the message parts plus
-// metadata.is_complete — and it is a plain Bearer call, no browser needed.
-//
-// A writing block arrives fenced, which is presentation, not content:
-//   :::writing{variant="standard" id="58322" title="短くした2本目"}
-//   夜ごはんを作り終わると、…
-//   :::
+// `apiAnswer` is pure HTTP already. Kept exported because the daemon reads
+// conversation history through it. See send-side notes for the delicate parts.
+
+// Writing-block answers come fenced; this is presentation, not content.
 const WRITING_FENCE = /^:::writing\{[^}]*\}\s*\n([\s\S]*?)\n?:::\s*$/;
-function unfence(s) {
-  const m = WRITING_FENCE.exec(s.trim());
-  return (m ? m[1] : s).trim();
-}
-
-// The tip of the conversation: {nodeId, text, images, complete}.
-//
-// `current_node` is the authoritative tip, so there is no "newest by timestamp"
-// guesswork. What finishes a turn depends on what the turn produced:
-//   - text            assistant / content_type "text" / metadata.is_complete
-//   - generated image tool / "multimodal_text" holding image_asset_pointer parts
-//     (image gen leaves no is_complete anywhere — the tool message IS the end,
-//     and the trailing assistant turn is an invisible code stub)
-// recipient !== "all" means the message is addressed to a tool, i.e. the turn is
-// still mid-flight.
-// Web-search / grounded answers embed citation spans delimited by private-use
-// characters: U+E200 <cite> U+E202 turn0search12 U+E202 … U+E201. The web UI
-// renders them as citation chips; in plain text they read as
-// "citeturn0search12turn0search11". Strip the spans and any stray PUA markers.
-// Such answers also sometimes append an unwrapped nav token on its own line
-// (e.g. "genuigC1t"); drop a trailing isolated gibberish token, but only when
-// citations were actually present, so normal answers are never touched.
+function unfence(s) { const m = WRITING_FENCE.exec(s.trim()); return (m ? m[1] : s).trim(); }
+// Web-search answers embed citation spans in U+E200..E202. Strip them.
 function stripCitations(s) {
-  const hadCite = /[-]/.test(s);
-  let t = s.replace(/[\s\S]*?/g, "").replace(/[-]/g, "");
+  const hadCite = /[-]/.test(s);
+  let t = s.replace(/[\s\S]*?/g, "").replace(/[-]/g, "");
   if (hadCite) {
     const m = t.match(/\n{2,}\s*([^\n]{3,20})\s*$/);
     if (m && /^[A-Za-z0-9]+$/.test(m[1]) && /[0-9]/.test(m[1]) && /[a-z]/.test(m[1]) && /[A-Z]/.test(m[1])) {
@@ -155,18 +202,16 @@ export async function apiAnswer(account, convId, via) {
   if (!tip) return { nodeId, text: "", images: [], complete: false };
   const toUser = (m) => (m.recipient || "all") === "all";
 
-  // Images live in a tool message that is NOT the tip: after image gen the tip
-  // is an assistant text message with parts [""] — the invisible code stub —
-  // carrying is_complete. So walk back from the tip to this turn's user message
-  // and collect every asset pointer on the way. (Uploads sit in the user
-  // message itself, which is why the walk stops there rather than including it.)
+  // Images live in a tool message that is NOT the tip (image gen's tip is an
+  // invisible assistant code stub). Walk back to this turn's user message and
+  // pick up every asset pointer along the way.
   const images = [];
   for (let id = nodeId, hops = 0; id && hops < 12; hops++) {
     const m = map[id]?.message;
     if (m?.author?.role === "user") break;
     for (const part of m?.content?.parts || []) {
       if (part && typeof part === "object" && part.content_type === "image_asset_pointer") {
-        const fid = String(part.asset_pointer || "").replace(/^[a-z]+:\/\//, ""); // sediment://file_… → file_…
+        const fid = String(part.asset_pointer || "").replace(/^[a-z]+:\/\//, "");
         if (fid) images.unshift({ id: fid, mime: part.mime_type || "image/png", width: part.width, height: part.height });
       }
     }
@@ -179,20 +224,16 @@ export async function apiAnswer(account, convId, via) {
   }
 
   // Done when the tip says so, or when the tip IS the image-bearing tool turn.
-  //
-  // is_complete is NOT reliable on its own: some finished answers never get it
-  // (nor finish_details) — measured 2026-09-13, "8" sat as status
-  // finished_successfully + end_turn true with no is_complete, and send waited
-  // out its whole 120s timeout on an answer that was done at +2.8s. status and
-  // end_turn are on every message; while streaming they read in_progress/null.
+  // `is_complete` is not reliable alone (measured 2026-09-13 — some answers
+  // finish with status finished_successfully + end_turn and never set it).
   const finished = tip.metadata?.is_complete === true
     || (tip.author?.role === "assistant" && tip.status === "finished_successfully" && tip.end_turn === true)
     || (tip.author?.role === "tool" && toUser(tip) && images.length > 0);
   return { nodeId, text, images, complete: finished && (text.length > 0 || images.length > 0) };
 }
 
-// Generated images download over plain HTTP: ask for a signed URL, then fetch it
-// WITH the bearer + cookie — the signature alone gives 403.
+// Generated images download over plain HTTP: ask for a signed URL, then fetch
+// WITH bearer + cookie. The signature alone 403s.
 const EXT = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
 async function downloadAsset(account, fileId, via) {
   const r = await api(account, "GET", `/backend-api/files/${fileId}/download`, { via });
@@ -202,386 +243,395 @@ async function downloadAsset(account, fileId, via) {
   return { buf: Buffer.from(await res.arrayBuffer()), name: r.file_name || fileId };
 }
 
-// Swallow a transient API read error (429, a blip) so polling carries on — but
-// not a dead bearer: every later read would 401 too, and an image-gen turn has
-// no DOM text to fall back on, so the loop would silently run to its timeout.
-function fatalOnly(e) {
-  if (e?.code === "AUTH_EXPIRED") throw e;
+// ── Uploading a file to the account ──────────────────────────────────────────
+//
+// Three-step flow (reverse-engineered 2026-10-15):
+//   1. POST /backend-api/files            → {upload_url, file_id}
+//   2. PUT  <upload_url> + raw bytes       (Azure Blob; x-ms-blob-type required)
+//   3. POST /backend-api/files/process_upload_stream
+//                                          → NDJSON stream, final event:
+//                                            file.processing.completed with
+//                                            {library_file_id, library_file_name}
+// The returned metadata is what the message turn needs under both
+// `content.parts` (as asset_pointer for images) and `metadata.attachments`
+// (for every file, regardless of type).
+const MIME_BY_EXT = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif",
+  pdf: "application/pdf", txt: "text/plain", md: "text/markdown", json: "application/json",
+  csv: "text/csv", html: "text/html", xml: "application/xml", yml: "application/x-yaml",
+  yaml: "application/x-yaml",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+function mimeOf(filePath) {
+  const ext = (path.extname(filePath).replace(/^\./, "") || "").toLowerCase();
+  return MIME_BY_EXT[ext] || "application/octet-stream";
+}
+
+// Enough of PNG/JPEG/WebP/GIF to read width×height without a dependency. The
+// server appears to be lenient when these are off, but a correct pair avoids a
+// "please re-upload" when the client-side preview is rendered later.
+function imageDimensions(buf, mime) {
+  try {
+    if (mime === "image/png" && buf.length >= 24 && buf.toString("ascii", 1, 4) === "PNG") {
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    if (mime === "image/gif" && buf.length >= 10 && buf.toString("ascii", 0, 3) === "GIF") {
+      return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+    }
+    if (mime === "image/jpeg") {
+      // Scan for SOFn marker (0xFFC0..0xFFCF, except 0xC4/0xC8/0xCC).
+      let i = 2;
+      while (i < buf.length - 9) {
+        if (buf[i] !== 0xff) { i++; continue; }
+        const m = buf[i + 1];
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+          return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+        }
+        const len = buf.readUInt16BE(i + 2);
+        i += 2 + len;
+      }
+    }
+    if (mime === "image/webp" && buf.length >= 30 && buf.toString("ascii", 0, 4) === "RIFF") {
+      // VP8X extended format: dimensions at offset 24, 24-bit little-endian minus 1.
+      if (buf.toString("ascii", 12, 16) === "VP8X") {
+        return { width: 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)),
+                 height: 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16)) };
+      }
+    }
+  } catch { /* fall through */ }
   return null;
 }
 
-// Send one prompt on an already-open, ready page. Returns {text, images, conversationId, timings}.
-async function sendOnPage(page, prompt, { account, via, timeoutMs = 120000, attach = null, docs = null } = {}) {
+// Return {id, libraryId, name, mime, size, width?, height?}.
+// useCase: "multimodal" for images, "my_files" for documents.
+async function uploadFile(account, auth, filePath, { useCase, via }) {
+  const buf = fs.readFileSync(filePath);
+  const name = path.basename(filePath);
+  const mime = mimeOf(filePath);
+  const isImage = useCase === "multimodal";
+  const dims = isImage ? imageDimensions(buf, mime) : null;
+  // Step 1: request an upload slot.
+  const slot = await api(account, "POST", "/backend-api/files", {
+    via,
+    json: {
+      entry_surface: "chat_composer",
+      file_name: name,
+      file_size: buf.length,
+      client_resolved_mime_type: mime,
+      mime_resolution_source: "filename_extension",
+      mime_type: mime,
+      reset_rate_limits: false,
+      supports_direct_azure_multipart: true,
+      timezone_offset_min: new Date().getTimezoneOffset(),
+      use_case: useCase,
+      store_in_library: true,
+      library_persistence_mode: "opportunistic",
+    },
+  });
+  if (!slot?.upload_url || !slot?.file_id) throw new Error(`files/alloc: ${JSON.stringify(slot).slice(0, 200)}`);
+  // Step 2: PUT bytes to Azure Blob (bearer NOT attached — the sig in the URL is the auth).
+  const putRes = await fetch(slot.upload_url, {
+    method: "PUT",
+    headers: {
+      "content-type": mime,
+      "x-ms-blob-content-type": mime,
+      "x-ms-blob-type": "BlockBlob",
+      "x-ms-version": "2020-04-08",
+    },
+    body: buf,
+  });
+  if (!putRes.ok) throw new Error(`PUT upload → ${putRes.status}: ${(await putRes.text()).slice(0, 160)}`);
+  // Step 3: kick server-side processing and wait for `file.processing.completed`.
+  const procRes = await fetch(`${BASE}/backend-api/files/process_upload_stream`, {
+    method: "POST",
+    headers: await authHeaders(account, { via, extra: { "content-type": "application/json" } }),
+    body: JSON.stringify({
+      entry_surface: "chat_composer",
+      file_id: slot.file_id,
+      file_name: name,
+      index_for_retrieval: !isImage,          // docs get RAG indexing
+      library_persistence_mode: "opportunistic",
+      metadata: { store_in_library: true, is_project_thread: false },
+      mime_type: mime,
+      use_case: useCase,
+    }),
+  });
+  if (!procRes.ok) throw new Error(`process_upload_stream → ${procRes.status}: ${(await procRes.text()).slice(0, 200)}`);
+  const text = await procRes.text();  // NDJSON — a few short lines, read-once is fine.
+  let libraryId = null, serverName = name, serverMime = mime;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const ev = JSON.parse(line);
+      if (ev.extra?.metadata_object_id) libraryId = ev.extra.metadata_object_id;
+      if (ev.extra?.library_file_name) serverName = ev.extra.library_file_name;
+      if (ev.extra?.mime_type) serverMime = ev.extra.mime_type;
+    } catch { /* ignore partial frames */ }
+  }
+  return {
+    id: slot.file_id,
+    libraryId,
+    name: serverName,
+    mime: serverMime,
+    size: buf.length,
+    ...(dims || {}),
+  };
+}
+
+// ── 4. The send itself ───────────────────────────────────────────────────────
+
+// Walk the SSE stream looking for the conversation_id and the end-of-turn.
+// We never try to reconstruct text from the deltas — the final GET of
+// /backend-api/conversation/<id> is cleaner and matches apiAnswer's shape.
+async function readSendStream(res, timeoutMs) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let convId = null;
+  let doneSignal = false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !doneSignal) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    while (true) {
+      const i = buf.indexOf("\n");
+      if (i < 0) break;
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '"v1"') continue;
+      // The last data line is literally `[DONE]`. Everything before it is JSON.
+      if (payload === "[DONE]") { doneSignal = true; break; }
+      try {
+        const j = JSON.parse(payload);
+        if (!convId) {
+          // conversation_id turns up on the first `add` patch's message.metadata
+          // or on the top-level `v` of a resume_conversation_token event.
+          convId = j?.v?.conversation_id || j?.conversation_id || convId;
+          if (!convId && j?.v?.message?.metadata?.conversation_id) convId = j.v.message.metadata.conversation_id;
+        }
+      } catch { /* some SSE lines are plain strings */ }
+    }
+  }
+  return { convId, closedCleanly: doneSignal };
+}
+
+// Build the message turn the way the webtrace capture shows the real client.
+// `attachments` is a list of {id, libraryId, name, mime, size, width?, height?}
+// — images go into content.parts as asset_pointers, every file goes into
+// metadata.attachments.
+function buildTurn(prompt, { parentId, gizmoId = null, attachments = [] }) {
+  const images = attachments.filter(a => /^image\//.test(a.mime));
+  const parts = [
+    ...images.map(a => ({
+      asset_pointer: `sediment://${a.id}`,
+      content_type: "image_asset_pointer",
+      height: a.height || 1,
+      size_bytes: a.size,
+      width: a.width || 1,
+    })),
+    prompt,
+  ];
+  const content = images.length
+    ? { content_type: "multimodal_text", parts }
+    : { content_type: "text", parts: [prompt] };
+  const metadata = attachments.length
+    ? { attachments: attachments.map(a => ({
+        ...(a.height ? { height: a.height } : {}),
+        id: a.id,
+        library_file_id: a.libraryId,
+        mime_type: a.mime,
+        name: a.name,
+        size: a.size,
+        ...(a.width ? { width: a.width } : {}),
+      })) }
+    : {};
+  const body = {
+    turn_attribution: { turn_trigger: "composer" },
+    action: "next",
+    is_do_not_remember: false,
+    model: "auto",
+    parent_message_id: parentId || "client-created-root",
+    timezone: "Asia/Tokyo",
+    timezone_offset_min: new Date().getTimezoneOffset(),
+    client_contextual_info: {
+      app_name: "chatgpt.com",
+      app_surface: "codex_browser",
+      has_web_push_capabilities: true,
+      web_push_notification_permission: "default",
+    },
+    local_function_names: ["local.continue_in_work"],
+    messages: [{
+      author: { metadata: {}, name: null, role: "user" },
+      channel: null,
+      content,
+      create_time: Date.now() / 1000,
+      end_turn: null,
+      id: uuid(),
+      metadata,
+      recipient: "all",
+      status: "finished_successfully",
+      update_time: null,
+      weight: 1,
+    }],
+    supported_encodings: ["v1"],
+    genui_state_snapshots: [],
+    client_prepare_state: "sent",
+  };
+  // Project / Custom GPT routing — the pool differs enough that the backend
+  // returns "Model not found" without these two keys.
+  if (gizmoId) {
+    body.conversation_mode = { kind: "gizmo_interaction", gizmo_id: gizmoId };
+    body.gizmo_id = gizmoId;
+  }
+  return body;
+}
+
+// Resolve the "parent" node of an existing conversation so the follow-up chains
+// correctly. Null convId → "client-created-root" (what the real client sends
+// on a new chat).
+async function parentFor(account, convId, via) {
+  if (!convId) return null;
+  const a = await apiAnswer(account, convId, via).catch(() => null);
+  return a?.nodeId || null;
+}
+
+async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, via, gizmoId, attachments }) {
   const t = {};
   let s = now();
-  const composer = await readyComposer(page);
-  // Too many history reads — and GET /backend-api/conversation from this CLI
-  // counts — and the app lays a modal over the composer. Every click then
-  // burns a 30s timeout with a Playwright call log for an error, so say so.
-  if (await page.locator(RATE_LIMIT_MODAL).count()) {
-    throw Object.assign(
-      new Error("ChatGPT is rate-limiting this account (conversation-history modal) — wait a while, or use another account"),
-      { code: "RATE_LIMITED" },
-    );
-  }
-  // Saved cookies that no longer hold a web session still load a working
-  // composer — logged out. The prompt then goes out as an anonymous chat that
-  // never reaches the account (seen 2026-09-13 on an account whose Bearer
-  // still worked over HTTP), so refuse rather than answer from the wrong place.
-  if (await page.locator(LOGGED_OUT).count()) {
-    throw new Error("the ChatGPT page is logged out for this account — run `opengpt login` again");
-  }
-  await composer.click();
-  if (attach?.length) { await attachFiles(page, attach, { images: true, timeoutMs }); t.upload = now() - s; }
-  if (docs?.length) { await attachFiles(page, docs, { timeoutMs }); t.upload = now() - s; }
-  await composer.click();
-  await page.keyboard.insertText(prompt);
-  // The composer is React-controlled and occasionally ignores an inserted
-  // string when it mounted moments before the click (seen on project pages).
-  // Verify the text landed, and retype it as real keystrokes if it did not.
-  if (!(await composer.innerText().catch(() => "")).trim()) {
-    await composer.click();
-    await composer.type(prompt, { delay: 0 });
-  }
-  t.compose = now() - s;
+  const parentId = await parentFor(account, convId, via);
+  const headers = baseHeaders(auth, accountId);
+  const { chatRequirementsToken, proofToken, powMs, powIter } = await mintSentinelTokens(headers, auth.userAgent);
+  t.sentinel = now() - s;
 
-  // A stop button left over from the previous turn — routine on --same-chat
-  // follow-ups, where it outlives the answer — would make the "generation
-  // started" gate below pass instantly and hand back the PREVIOUS answer.
-  await page
-    .waitForFunction((stop) => !document.querySelector(stop), STOP_BTN, { timeout: 15000 })
-    .catch(() => {});
-
-  // On a continued chat the existing turns must be painted before we snapshot
-  // the pre-send baselines. On a cold warm page (daemon just started, softNav
-  // has only just routed into /c/<id>) the history is still rendering, so prevN
-  // reads 0 and the completion scan then treats the PREVIOUS answer as this
-  // turn's — the stale first reply. Wait for the prior answer to be on screen.
-  if (/\/c\/[^/?#]/.test(page.url())) {
-    await page.locator('[data-message-author-role="assistant"]').last()
-      .waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
-  }
-
-  // Baselines captured BEFORE sending: turns, the answer already on screen (so
-  // a follow-up cannot return it again), and images already in main (an
-  // uploaded attachment counts here so it isn't mistaken for a result).
-  const before = await page.locator(TURN).count();
-  const prev = await page.evaluate(() => {
-    const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-    for (let i = as.length - 1; i >= 0; i--) {
-      const v = as[i].innerText.trim();
-      if (v) return { n: as.length, text: v };
-    }
-    return { n: as.length, text: "" };
-  });
-  // API-side baseline: remember which node was the tip, so a follow-up cannot
-  // hand back the previous answer (which is itself "complete").
-  let convId = convIdFromUrl(page);
-  // Pre-send tip: a follow-up must not hand back the previous (already-complete)
-  // answer. This baseline read shares the conversation rate limit, so retry it a
-  // few times — if it stays null on a CONTINUED chat, the API break below would
-  // accept the old tip (null !== any nodeId) and return the stale previous
-  // answer (seen when rapid testing tripped the read limit).
-  const continuing = !!convId;
-  let prevNode = null;
-  for (let i = 0; continuing && i < 3 && prevNode === null; i++) {
-    prevNode = (await apiAnswer(account, convId, via).catch(fatalOnly))?.nodeId ?? null;
-    if (prevNode === null) await new Promise((r) => setTimeout(r, 400));
-  }
   s = now();
+  const body = buildTurn(prompt, { parentId, gizmoId, attachments });
+  if (convId) body.conversation_id = convId;
+  const sendHeaders = {
+    ...headers,
+    "openai-sentinel-chat-requirements-token": chatRequirementsToken,
+    "openai-sentinel-proof-token": proofToken,
+    "openai-sentinel-turnstile-token": "n/a",
+    "x-oai-turn-trace-id": uuid(),
+  };
 
-  // This turn's answer stream. Its closing is the moment the answer is done;
-  // polling the API alone noticed that up to ~2.4s late (measured: [DONE] at
-  // 4.8s, detected at 7.2s). Armed just before Enter so the PREVIOUS turn's
-  // stream cannot match — on a warm page it is often still closing ~0.8s into
-  // the next send. (/f/conversation/prepare is a different path.)
-  let streamClosed = false, streamConv = null, wake = () => {};
-  page
-    .waitForResponse(
-      (r) => r.request().method() === "POST" && new URL(r.url()).pathname === "/backend-api/f/conversation",
-      { timeout: timeoutMs },
-    )
-    .then(async (r) => {
-      await r.finished();
-      // The id is in the stream, for when the URL still holds the WEB: placeholder.
-      streamConv = /"conversation_id":\s*"([0-9a-f-]{36})"/.exec(await r.text().catch(() => ""))?.[1] || null;
-      streamClosed = true;
-      if (process.env.OPENGPT_DEBUG) process.stderr.write(`[dbg] +${Math.round(now() - s)}ms stream closed conv=${streamConv}\n`);
-      wake();
-    })
-    .catch(() => {});
-  await page.keyboard.press("Enter");
+  // /prepare primes the backend's conversation route. The real client always
+  // fires it; measured 2026-10-15 the SEND alone works too, but prepare is
+  // cheap and keeps us closer to the real traffic shape.
+  await fetch(`${BASE}/backend-api/f/conversation/prepare`, {
+    method: "POST", headers: sendHeaders, body: JSON.stringify(body),
+  }).catch(() => {});
+  t.prepare = now() - s;
 
-  // Generation started: the stop button appeared, a new turn rendered, or an
-  // image is already present. Image gen doesn't reliably keep an assistant/tool
-  // turn in the DOM, so gating on turn-count alone can hang.
-  //
-  // The Enter is sometimes swallowed — reproducibly on project pages, where the
-  // composer mounts late — and the prompt then sits in the box until the whole
-  // timeout expires. So wait briefly first, and click the send button before
-  // committing to the long wait.
-  const started = (ms) =>
-    // NOTE: page.waitForFunction takes ONE arg — pass a single object.
-    page.waitForFunction(
-      ({ n, sel, stop }) =>
-        !!document.querySelector(stop) || document.querySelectorAll(sel).length > n,
-      { n: before, sel: TURN, stop: STOP_BTN },
-      { timeout: ms },
-    );
-  const grace = Math.min(8000, timeoutMs);
-  let sent = false;
-  for (let attempt = 0; attempt < 3 && !sent; attempt++) {
-    if (attempt > 0) {
-      // Re-render can wipe the composer out from under us (long threads under
-      // /c/<id> are the usual case), so put the prompt back if it is gone, then
-      // prefer the button over another Enter.
-      if (!(await composer.innerText().catch(() => "")).trim()) {
-        await composer.click();
-        await page.keyboard.insertText(prompt);
-      }
-      const btn = page.locator(SEND_BTN).first();
-      if (await btn.count()) await btn.click({ timeout: 5000 }).catch(() => {});
-      else await page.keyboard.press("Enter");
-    }
-    const budget = attempt === 2 ? Math.max(timeoutMs - 2 * grace, 5000) : grace;
-    try { await started(budget); sent = true; } catch { /* try again */ }
+  s = now();
+  // 401 from the stream endpoint means the bearer died mid-flight. Try once
+  // to re-mint it via /api/auth/session (pure HTTP), then replay this send.
+  // A second 401 is a terminal AUTH_EXPIRED — the CLI's retry branch keys off
+  // this exact code so make sure it survives all the way out.
+  let res = await fetch(`${BASE}/backend-api/f/conversation`, {
+    method: "POST", headers: sendHeaders, body: JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    try { await refreshAuth(account, { via: via === "node" ? "node" : "auto" }); }
+    catch (e) { throw authExpiredError(account, `401 from /f/conversation, refresh failed: ${e.message}`); }
+    const auth2 = loadAuth(account);
+    const retryHeaders = { ...sendHeaders, authorization: `Bearer ${auth2.accessToken}`, cookie: cookieHeader(auth2) };
+    res = await fetch(`${BASE}/backend-api/f/conversation`, {
+      method: "POST", headers: retryHeaders, body: JSON.stringify(body),
+    });
+    if (res.status === 401) throw authExpiredError(account, `401 from /f/conversation after refresh`);
   }
-  if (!sent) throw new Error("generation never started — the prompt was not accepted by the composer");
+  if (!res.ok) {
+    const errBody = (await res.text()).slice(0, 400);
+    const err = new Error(`/f/conversation → ${res.status}: ${errBody}`);
+    err.status = res.status;
+    // 429 is the backend saying "too many requests" — the CLI's rate-limit
+    // retry branch and the daemon's "don't reset the warm page" check both
+    // look for this code, so tag it explicitly.
+    if (res.status === 429) err.code = "RATE_LIMITED";
+    throw err;
+  }
   t.firstToken = now() - s;
 
-  // Poll for completion. A "result" is a NEW generated image (not in the
-  // pre-send baseline, so an uploaded attachment doesn't count) or non-empty
-  // assistant text. Finish when generation stopped (stop button gone) with a
-  // result, OR when the result is stable for a few polls — the stop button does
-  // not reliably disappear for some responses (e.g. image analysis), so relying
-  // on it alone hangs. Uses wall-clock, fine in a normal Node process.
-  const deadline = Date.now() + timeoutMs;
-  let text = "", images = [], lastSig = null, stable = 0;
-  let nextApiAt = Date.now() + 6000, apiGap = 1000, closedSeen = false;
-  const read = () => page.evaluate(({ prevN }) => {
-    const as = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-    // When ChatGPT renders an answer as a writing block it appends clickable
-    // follow-up suggestions inside the same turn ("もう少し短くする" …). They are
-    // UI, not the answer, so drop them before reading the text.
-    const body = (el) => {
-      let raw;
-      const sug = el.querySelector('[data-testid="writing-block-suggested-followups"]');
-      if (!sug) raw = el.innerText.trim();
-      else {
-        const c = el.cloneNode(true);
-        c.querySelectorAll('[data-testid="writing-block-suggested-followups"]').forEach((n) => n.remove());
-        raw = c.innerText.trim();
-      }
-      // A reaction affordance ("message_reaction" + 👍/👎) renders inside the turn
-      // for a moment while the answer finalizes and otherwise glues onto the
-      // front of the text. It is UI, never part of the answer, so drop it.
-      return raw.replace(/message_reaction\s*[\u{1F44D}\u{1F44E}]?/gu, "").trim();
-    };
-    // Read ONLY assistant turns added by THIS send (index >= prevN). Scanning
-    // older turns let a follow-up fall back to the previous, already-complete
-    // answer while this turn was still empty (thinking) — that read as a stable
-    // result and returned the PREVIOUS answer. Reproduced on the warm daemon
-    // page, where the reply is fast and this DOM path wins over the API poll.
-    let text = "";
-    for (let i = as.length - 1; i >= prevN; i--) { const v = body(as[i]); if (v) { text = v; break; } }
-    const stop = !!document.querySelector('button[data-testid="stop-button"]');
-    return { text, stop };
-  }, { prevN: prev.n });
+  // Walk the SSE stream just enough to learn the conversation id and detect
+  // end-of-turn; the authoritative final text comes from the follow-up GET.
+  const { convId: streamConv } = await readSendStream(res, timeoutMs);
+  const conversationId = streamConv || convId || null;
+  t.stream = now() - s;
 
-  while (Date.now() < deadline) {
-    // Preferred path: ask the API. It reports the finished text and an explicit
-    // is_complete, so there is nothing to infer from the page.
-    if (!convId) convId = convIdFromUrl(page) || streamConv;
-    // The API rate-limits a steady poll (429 — and every warm send adds to the
-    // same bucket), so ask it when there is a reason to: right as this turn's
-    // stream closes, then backing off 1s → 2s → 4s while the answer commits.
-    // While the stream is still open, only a slow fallback poll, for the page
-    // that drops its stream while the server finishes the answer anyway.
-    if (streamClosed && !closedSeen) { closedSeen = true; nextApiAt = 0; }
-    if (convId && Date.now() >= nextApiAt) {
-      let err = null;
-      const a = await apiAnswer(account, convId, via).catch((e) => { fatalOnly(e); err = e; return null; });
-      if (process.env.OPENGPT_DEBUG) {
-        process.stderr.write(`[dbg] +${Math.round(now() - s)}ms conv=${convId} node=${a?.nodeId} complete=${a?.complete} imgs=${a?.images?.length}${err ? ` error=${err.message.slice(0, 80)}` : ""}\n`);
-      }
-      // When the pre-send tip is unknown on a continued chat (baseline read kept
-      // failing), nodeId !== null always holds, so the OLD answer would match.
-      // Reject it with the pre-send text baseline before accepting completion.
-      const stale = continuing && prevNode === null && a?.text && a.text === prev.text;
-      if (a?.complete && a.nodeId && a.nodeId !== prevNode && !stale) {
-        text = a.text;
-        images = a.images;
-        break;
-      }
-      if (err && /→ 429/.test(err.message)) nextApiAt = Date.now() + 8000;
-      else if (streamClosed) { nextApiAt = Date.now() + apiGap; apiGap = Math.min(apiGap * 2, 4000); }
-      else nextApiAt = Date.now() + 6000;
-    }
-
-    const st = await read();
-    text = st.text; // already restricted to this send's own turn(s)
-    const hasResult = text.length > 0;
-    // Always finish on a quiet period, never on the stop button alone: the
-    // button disappears before the last of the text renders on multi-item
-    // answers (measured — it truncated a 5-post reply mid-sentence). While the
-    // button is still up we may be mid-stream on a slow answer, so demand a
-    // much longer quiet period there.
-    const needed = st.stop ? 8 : 2; // ~12s while generating, ~3s after
-    const sig = text;
-    if (hasResult && sig === lastSig) {
-      if (++stable >= needed) {
-        // The DOM says the answer is stable, but the DOM is a dirty text source
-        // (UI artifacts like reactions, follow-up chips). Prefer the API's clean
-        // JSON text; keep the scraped text only when the API can't be read (429).
-        if (convId) {
-          const a = await apiAnswer(account, convId, via).catch(fatalOnly);
-          const stale = continuing && prevNode === null && a?.text && a.text === prev.text;
-          if (a?.complete && a.nodeId && a.nodeId !== prevNode && !stale) { text = a.text; images = a.images; }
-        }
-        break;
-      }
-    } else stable = 0;
-    lastSig = sig;
-    // Sleep, but wake the moment the stream closes.
-    await new Promise((r) => {
-      const tm = setTimeout(r, streamClosed ? 700 : 1500);
-      wake = () => { clearTimeout(tm); r(); };
-    });
+  // Pull the clean final text + any images from the API, same as apiAnswer
+  // does for continuations.
+  let text = "", images = [];
+  if (conversationId) {
+    const a = await apiAnswer(account, conversationId, via).catch(() => null);
+    if (a) { text = a.text || ""; images = a.images || []; }
   }
-  t.total = now() - s;
-  return { text, images, conversationId: convIdFromUrl(page), timings: t };
+  t.total = now() - s + t.sentinel + t.prepare;
+  t.powMs = powMs; t.powIter = powIter;
+  return { text, images, conversationId, timings: t };
 }
 
-// Where a fresh turn should start. A Custom GPT keeps its /g/<gizmo> context;
-// otherwise a new blank chat at /. (The in-app new-chat button sits under the
-// sidebar overlay and its click is routinely intercepted, so navigate by URL.)
-function freshUrl({ gizmo }) {
-  if (!gizmo) return `${BASE}/`;
-  // A project (g-p-…) lives at /g/<gid>/project — plain /g/<gid> does not
-  // render a usable composer for it. Custom GPTs keep the bare /g/<gizmo>.
-  return gizmo.startsWith("g-p-") ? `${BASE}/g/${gizmo}/project` : `${BASE}/g/${gizmo}`;
-}
+// ── 5. Public API ────────────────────────────────────────────────────────────
 
-async function gotoAndReady(page, url) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await readyComposer(page);
-}
-
-// Client-side navigation, for a warm page that is already on chatgpt.com.
-// A full goto re-downloads and re-boots the SPA (~1.7s measured); routing
-// in-page costs ~50ms. pushState ALONE does not work — the URL changes and the
-// old conversation stays rendered — because the router listens for popstate,
-// so the event has to be dispatched too (measured: turns 10 → 0).
-// Returns false when the page is not somewhere this can work from.
-async function softNav(page, url) {
-  if (!/^https:\/\/chatgpt\.com/.test(page.url())) return false;
-  const target = url.replace(BASE, "") || "/";
-  try {
-    // Already there — nothing to navigate. Compare by conversation id, not by
-    // raw path: inside a project the URL is /g/<gid>/c/<id> while the target is
-    // built as /c/<id>, so a string compare misses and softNav would wait out
-    // its whole timeout (turns never change) before falling back to a reload.
-    const here = new URL(page.url()).pathname;
-    const convOf = (u) => (/\/c\/([^/?#]+)/.exec(u) || [])[1] || null;
-    const hereConv = convOf(here), wantConv = convOf(target);
-    if (wantConv ? hereConv === wantConv : here === target.split("?")[0]) {
-      await readyComposer(page);
-      return true;
-    }
-    const before = await page.locator(TURN).count();
-    await page.evaluate((t) => {
-      window.history.pushState({}, "", t);
-      window.dispatchEvent(new PopStateEvent("popstate", { state: {} }));
-    }, target);
-    // The route took effect when the old turns are gone (new chat) or replaced.
-    await page.waitForFunction(
-      ({ sel, n, want }) =>
-        location.pathname === want && (document.querySelectorAll(sel).length !== n || n === 0),
-      { sel: TURN, n: before, want: target.split("?")[0] },
-      { timeout: 8000 },
-    );
-    await readyComposer(page);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function navReady(page, url) {
-  if (await softNav(page, url)) return;
-  await gotoAndReady(page, url);
-}
-
-// Batch entry: open the browser once, send every prompt on the warm page.
-//   system         prepend instruction text to each prompt (skill content, etc.)
-//   conversationId continue an existing thread instead of starting fresh
-//   gizmo          route to a specific Custom GPT (gizmo id)
-//   sameChat       keep every prompt in one conversation (no nav = fastest)
+// Batched entry: pure HTTP, no browser. headed / lean / context / via inputs
+// are kept for signature compatibility — they're no-ops.
+//
+// Attachments:
+//   attach - array of image paths (uploaded with use_case="multimodal")
+//   docs   - array of document paths (uploaded with use_case="my_files")
+//   Uploads happen once up-front; the same ids are reused across sameChat
+//   prompts so a batched follow-up re-sees the files without re-uploading.
 export async function send({
-  account, prompts, headed = false, lean = false, sameChat = false,
-  system = null, conversationId = null, gizmo = null, saveDir = null,
-  attach = null, docs = null, timeoutMs = 120000, via = "auto",
-  // A warm context from the daemon. When given, send() borrows it and leaves
-  // it open; otherwise it launches one and closes it on the way out.
-  context: borrowed = null,
+  account, prompts, system = null, conversationId = null,
+  sameChat = false, timeoutMs = 120000, via = "auto", saveDir = null,
+  attach = null, docs = null, gizmo = null,
+  // signature-compatibility only:
+  headed, lean, context,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
-  // Fail before the browser launch, not at the timeout: the answer is read over
-  // the API, so a bearer that cannot be re-minted makes the whole send useless.
+
   await ensureAuth(account, { via });
   const auth = loadAuth(account);
-  const timings = { launch: 0, load: 0, perPrompt: [] };
+  const accountId = await resolveAccountId(account, auth);
+
+  // Upload up front — same uploads are reused across every prompt in the batch.
+  const attachments = [];
+  for (const p of attach || []) attachments.push(await uploadFile(account, auth, p, { useCase: "multimodal", via }));
+  for (const p of docs || []) attachments.push(await uploadFile(account, auth, p, { useCase: "my_files", via }));
+
+  const timings = { perPrompt: [], uploads: attachments.length };
   const frame = (p) => (system ? `${system}\n\n${p}` : p);
-
-  let s = now();
-  // Ephemeral context seeded from saved cookies — no persistent profile, so no
-  // lock and no conflict with a concurrent run on the same account.
-  const context = borrowed || (await openEphemeral(auth, { headed, lean }));
-  timings.launch = borrowed ? 0 : now() - s;
-
-  try {
-    const page = context.pages()[0] || (await context.newPage());
-    s = now();
-    // Start on: an existing conversation, a Custom GPT, or a blank chat.
-    const start = conversationId ? `${BASE}/c/${conversationId}` : freshUrl({ gizmo });
-    // A borrowed page is already on chatgpt.com, so route in-page instead of
-    // paying the full SPA boot again.
-    if (borrowed) await navReady(page, start);
-    else await gotoAndReady(page, start);
-    timings.load = now() - s;
-
-    const results = [];
-    for (let i = 0; i < prompts.length; i++) {
-      if (i > 0 && !sameChat) await navReady(page, freshUrl({ gizmo }));
-      const r = await sendOnPage(page, frame(prompts[i]), { account, via, timeoutMs, attach, docs });
-      timings.perPrompt.push(r.timings);
-      const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
-      // Download generated images through the live context (cookies attached);
-      // these URLs 403 with "File stream access denied" without auth.
-      if (saveDir && res.images.length) {
-        fs.mkdirSync(saveDir, { recursive: true });
-        res.savedPaths = [];
-        for (let k = 0; k < res.images.length; k++) {
-          const im = res.images[k];
-          try {
-            const { buf } = await downloadAsset(account, im.id, via);
-            const p = path.join(saveDir, `${res.conversationId || "img"}-${i}-${k}.${EXT[im.mime] || "png"}`);
-            fs.writeFileSync(p, buf);
-            res.savedPaths.push(p);
-          } catch { /* skip a failed image, keep the rest */ }
-        }
+  let convCursor = conversationId;
+  const results = [];
+  for (let i = 0; i < prompts.length; i++) {
+    // Attachments are a feature of the first turn; follow-ups inside the same
+    // thread should NOT re-paste them.
+    const turnAttachments = i === 0 ? attachments : [];
+    const r = await sendOne(account, auth, accountId, frame(prompts[i]), {
+      convId: convCursor, timeoutMs, via,
+      gizmoId: gizmo || null,
+      attachments: turnAttachments,
+    });
+    timings.perPrompt.push(r.timings);
+    const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
+    if (sameChat && res.conversationId) convCursor = res.conversationId;
+    // Download generated images while the bearer is live.
+    if (saveDir && res.images.length) {
+      fs.mkdirSync(saveDir, { recursive: true });
+      res.savedPaths = [];
+      for (const im of res.images) {
+        try {
+          const { buf } = await downloadAsset(account, im.id, via);
+          const p = path.join(saveDir, `${res.conversationId || "img"}-${im.id.replace(/^file_0*/, "").slice(0, 12)}.${EXT[im.mime] || "png"}`);
+          fs.writeFileSync(p, buf);
+          res.savedPaths.push(p);
+        } catch { /* skip a failed image, keep the rest */ }
       }
-      results.push(res);
     }
-
-    // Persist rotated cookies (cf_bm etc.) so the saved auth stays fresh.
-    try {
-      const state = await context.storageState();
-      if (state.cookies?.length) { auth.cookies = state.cookies; saveAuth(account, auth); }
-    } catch {}
-
-    return { results, timings };
-  } finally {
-    if (!borrowed) await context.close().catch(() => {});
+    results.push(res);
   }
+  return { results, timings };
 }
