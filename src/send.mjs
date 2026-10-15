@@ -549,8 +549,7 @@ async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, vi
     const err = new Error(`/f/conversation → ${res.status}: ${errBody}`);
     err.status = res.status;
     // 429 is the backend saying "too many requests" — the CLI's rate-limit
-    // retry branch and the daemon's "don't reset the warm page" check both
-    // look for this code, so tag it explicitly.
+    // branch keys off this code, so tag it explicitly.
     if (res.status === 429) err.code = "RATE_LIMITED";
     throw err;
   }
@@ -576,20 +575,20 @@ async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, vi
 
 // ── 5. Public API ────────────────────────────────────────────────────────────
 
-// Batched entry: pure HTTP, no browser. headed / lean / context / via inputs
-// are kept for signature compatibility — they're no-ops.
+// Batched entry: pure HTTP, no browser.
 //
 // Attachments:
 //   attach - array of image paths (uploaded with use_case="multimodal")
 //   docs   - array of document paths (uploaded with use_case="my_files")
 //   Uploads happen once up-front; the same ids are reused across sameChat
 //   prompts so a batched follow-up re-sees the files without re-uploading.
+//
+// `via` is here only for apiAnswer / downloadAsset: those read endpoints
+// still have the "node → browser on CF challenge" fallback in http.mjs.
 export async function send({
   account, prompts, system = null, conversationId = null,
   sameChat = false, timeoutMs = 120000, via = "auto", saveDir = null,
   attach = null, docs = null, gizmo = null,
-  // signature-compatibility only:
-  headed, lean, context,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
 

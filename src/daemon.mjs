@@ -68,15 +68,13 @@ export async function request(account, payload, { timeoutMs = 300000 } = {}) {
 }
 
 // Start a daemon in the background and wait for it to accept connections.
-// Used by `send` so a burst of prompts pays browser startup once without the
-// user having to manage a process — and the idle timeout gives the memory and
-// the session seat back when the burst ends.
-export async function ensure(account, { lean = true, idleMs = DEFAULT_IDLE_MS, waitMs = 60000 } = {}) {
+// Used by `send` so a burst of prompts shares one single-flight gate — and
+// the idle timeout gives the socket back when the burst ends.
+export async function ensure(account, { idleMs = DEFAULT_IDLE_MS, waitMs = 60000 } = {}) {
   if (await isRunning(account)) return { started: false };
   const { spawn } = await import("node:child_process");
   const cli = new URL("../cli.mjs", import.meta.url).pathname;
   const args = [cli, "daemon", "--account", account, "start", "--idle", String(Math.round(idleMs / 1000))];
-  if (!lean) args.push("--no-lean");
   const child = spawn(process.execPath, args, { detached: true, stdio: "ignore" });
   child.unref();
   const deadline = Date.now() + waitMs;
@@ -100,10 +98,7 @@ export async function status(account) {
 }
 
 // Run the daemon. Resolves when it shuts down.
-// `headed` and `lean` are kept for signature compatibility with the old CLI
-// `daemon start` command — they used to control the browser launch; now they
-// have no effect.
-export async function serve(account, { headed, lean, idleMs = DEFAULT_IDLE_MS } = {}) {
+export async function serve(account, { idleMs = DEFAULT_IDLE_MS } = {}) {
   const sockPath = socketPath(account);
   if (await isRunning(account)) throw new Error(`a daemon is already running for "${account}"`);
   fs.rmSync(sockPath, { force: true });
