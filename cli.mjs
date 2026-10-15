@@ -116,7 +116,7 @@ const HELP = `opengpt — ChatGPT backend-api client
 
 Global:  --via auto|node|browser   (read commands; default auto)
          --raw                      print raw response text
-Env:     OPENGPT_AUTH_DIR, OPENGPT_PROFILE_ROOT`;
+Env:     OPENGPT_AUTH_DIR, OPENGPT_PROFILE_ROOT, OPENGPT_DAEMON_IDLE (sec), OPENGPT_DEBUG`;
 
 function out(v) {
   if (typeof v === "string") process.stdout.write(v.endsWith("\n") ? v : v + "\n");

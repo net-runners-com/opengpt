@@ -9,7 +9,7 @@ const authPath = (account) => path.join(AUTH_DIR, `${account}.json`);
 
 export function loadAuth(account) {
   const p = authPath(account);
-  if (!fs.existsSync(p)) throw new Error(`no saved auth for "${account}". Run: gptcli login --profile <name> --account ${account}`);
+  if (!fs.existsSync(p)) throw new Error(`no saved auth for "${account}". Run: opengpt login --profile <name> --account ${account}`);
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 

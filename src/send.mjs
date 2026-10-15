@@ -32,7 +32,6 @@ import { refresh as refreshAuth } from "./auth.mjs";
 const now = () => performance.now();
 const uuid = () => crypto.randomUUID();
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── 1. Proof-of-work ─────────────────────────────────────────────────────────
 //
