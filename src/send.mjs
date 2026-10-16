@@ -233,6 +233,86 @@ export async function apiAnswer(account, convId, via) {
   return { nodeId, text, images, complete: finished && (text.length > 0 || images.length > 0) };
 }
 
+// ── Scrub C2PA / EXIF / other provenance metadata from a downloaded image ───
+//
+// ChatGPT ships generated PNGs with a `caBX` chunk — a ~24 KB C2PA JUMBF
+// manifest marking the image as AI-generated. JPEGs carry the same manifest in
+// an APP11 marker; WebPs in EXIF/XMP/ICCP chunks. Everything we save goes
+// through this scrubber by default so a reposted image doesn't trip
+// AI-provenance checks downstream. Caller can opt out with `keepMetadata`.
+//
+// Approach is a hard whitelist per format: keep only the chunks the decoder
+// needs for pixels, drop everything else. iCCP (color profile) can and does
+// hide C2PA data too, so iCCP is dropped — the tiny color-accuracy cost is
+// acceptable in the "I want this image clean" workflow.
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_KEEP = new Set(["IHDR", "PLTE", "IDAT", "IEND", "tRNS", "pHYs", "gAMA", "cHRM", "sRGB"]);
+function stripPng(buf) {
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_MAGIC)) return buf;
+  const out = [PNG_MAGIC];
+  let i = 8;
+  while (i < buf.length - 4) {
+    const len = buf.readUInt32BE(i);
+    const type = buf.toString("ascii", i + 4, i + 8);
+    const chunk = buf.subarray(i, i + 12 + len);
+    if (PNG_KEEP.has(type)) out.push(chunk);
+    i += 12 + len;
+    if (type === "IEND") break;
+  }
+  return Buffer.concat(out);
+}
+function stripJpeg(buf) {
+  if (buf.length < 2 || buf[0] !== 0xff || buf[1] !== 0xd8) return buf;
+  const out = [Buffer.from([0xff, 0xd8])];
+  let i = 2;
+  while (i < buf.length - 1) {
+    if (buf[i] !== 0xff) { i++; continue; }
+    const m = buf[i + 1];
+    if (m === 0xd9) { out.push(Buffer.from([0xff, 0xd9])); break; }           // EOI
+    if (m === 0xda) { out.push(buf.subarray(i)); break; }                     // SOS → copy entropy payload through EOI
+    if (m >= 0xd0 && m <= 0xd7) { out.push(buf.subarray(i, i + 2)); i += 2; continue; } // RSTn (no length)
+    const len = buf.readUInt16BE(i + 2);
+    const seg = buf.subarray(i, i + 2 + len);
+    // Drop every application-defined and comment segment — APP0-APP15 and COM
+    // are where EXIF, XMP, JUMBF/C2PA and provenance tags live.
+    const drop = (m >= 0xe0 && m <= 0xef) || m === 0xfe;
+    if (!drop) out.push(seg);
+    i += 2 + len;
+  }
+  return Buffer.concat(out);
+}
+const WEBP_KEEP = new Set(["VP8 ", "VP8L", "VP8X", "ALPH", "ANIM", "ANMF"]);
+function stripWebp(buf) {
+  if (buf.length < 12 || buf.toString("ascii", 0, 4) !== "RIFF" || buf.toString("ascii", 8, 12) !== "WEBP") return buf;
+  const chunks = [];
+  let i = 12;
+  while (i < buf.length - 8) {
+    const type = buf.toString("ascii", i, i + 4);
+    const len = buf.readUInt32LE(i + 4);
+    const padded = len + (len & 1);
+    if (WEBP_KEEP.has(type)) chunks.push(buf.subarray(i, i + 8 + padded));
+    i += 8 + padded;
+  }
+  // VP8X flags: bit 3 = ICCP, bit 4 = ALPHA (keep), bit 5 = EXIF, bit 6 = XMP,
+  // bit 7 (0x80) reserved. Clear ICC/EXIF/XMP since we dropped those chunks.
+  for (const c of chunks) {
+    if (c.toString("ascii", 0, 4) === "VP8X") c[8] &= ~0b01101000;
+  }
+  const body = Buffer.concat(chunks);
+  const out = Buffer.alloc(12 + body.length);
+  out.write("RIFF", 0, "ascii");
+  out.writeUInt32LE(4 + body.length, 4);
+  out.write("WEBP", 8, "ascii");
+  body.copy(out, 12);
+  return out;
+}
+export function stripMetadata(buf) {
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MAGIC)) return stripPng(buf);
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) return stripJpeg(buf);
+  if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return stripWebp(buf);
+  return buf;
+}
+
 // Generated images download over plain HTTP: ask for a signed URL, then fetch
 // WITH bearer + cookie. The signature alone 403s.
 const EXT = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
@@ -590,6 +670,9 @@ export async function send({
   account, prompts, system = null, conversationId = null,
   sameChat = false, timeoutMs = 120000, via = "auto", saveDir = null,
   attach = null, docs = null, gizmo = null,
+  // keepMetadata: default false — scrub C2PA/EXIF/JUMBF from downloaded
+  // images on the way to disk. Opt in to retain the AI-provenance tag.
+  keepMetadata = false,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
 
@@ -625,8 +708,9 @@ export async function send({
       for (const im of res.images) {
         try {
           const { buf } = await downloadAsset(account, im.id, via);
+          const clean = keepMetadata ? buf : stripMetadata(buf);
           const p = path.join(saveDir, `${res.conversationId || "img"}-${im.id.replace(/^file_0*/, "").slice(0, 12)}.${EXT[im.mime] || "png"}`);
-          fs.writeFileSync(p, buf);
+          fs.writeFileSync(p, clean);
           res.savedPaths.push(p);
         } catch { /* skip a failed image, keep the rest */ }
       }

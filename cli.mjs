@@ -22,7 +22,7 @@ import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 // `headed` is kept for `login` (interactive sign-in). `lean` / `no-lean` were
 // browser-only flags from the old composer-driven send; the pure-HTTP rewrite
 // (2026-10-15) made them meaningless, so they're dropped.
-const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon"];
+const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "keep-metadata"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   chat: new Set([...COMMON_BOOLEANS, "json", "list", "compact"]),
@@ -99,6 +99,7 @@ const HELP = `opengpt — ChatGPT backend-api client
          --json                 structured output: [{text, images, conversationId}] + timings
          --show-id              print each reply's conversation id (stderr)
          --save-images <dir>    download generated images (image-gen results) to <dir>
+         --keep-metadata        preserve C2PA/EXIF on saved images (default: strip)
          --image <path[,...]>   upload image file(s) with the prompt (vision / edit)
          --file <path[,...]>    attach document(s) to the chat (pdf/txt/csv/docx/…)
        Also: --same-chat --time.
@@ -291,6 +292,7 @@ async function main() {
         // conversation_mode.kind = "gizmo_interaction".
         gizmo,
         saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
+        keepMetadata: !!opts["keep-metadata"],  // default: strip C2PA/EXIF from saved images
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)
         timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more

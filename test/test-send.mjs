@@ -257,6 +257,62 @@ async function case11_rateLimitShape() {
   }
 }
 
+async function case12bis_stripMetadata() {
+  console.log("=== case 12b: stripMetadata removes C2PA/EXIF/APPx");
+  const { stripMetadata } = await import("../src/send.mjs");
+  const zlib = await import("node:zlib");
+
+  // Build a tiny valid PNG and splice a caBX (C2PA) chunk + an iTXt chunk
+  // between IHDR and IDAT, mirroring what ChatGPT actually ships.
+  const W = 2, H = 2;
+  const raw = Buffer.concat(Array.from({ length: H }, () =>
+    Buffer.concat([Buffer.from([0]), Buffer.from(Array.from({ length: W }, () => [0xff, 0, 0]).flat())])));
+  const idat = zlib.deflateSync(raw);
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length, 0);
+    const t = Buffer.from(type, "ascii");
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(Buffer.concat([t, data])), 0);
+    return Buffer.concat([len, t, data, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("caBX", Buffer.from("JUMBF-C2PA-manifest-placeholder-" + "x".repeat(200))),
+    chunk("iTXt", Buffer.from("Software\0\0\0\0\0ChatGPT")),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+  const stripped = stripMetadata(png);
+  console.log("  before:", png.length, "bytes · after:", stripped.length, "bytes");
+  if (stripped.includes(Buffer.from("caBX"))) bad("caBX chunk survived strip");
+  else ok("caBX stripped");
+  if (stripped.includes(Buffer.from("iTXt"))) bad("iTXt chunk survived strip");
+  else ok("iTXt stripped");
+  if (stripped.length >= png.length) bad(`stripped size ${stripped.length} not < original ${png.length}`);
+  // Must still be a valid PNG: magic + IHDR + IDAT + IEND present.
+  for (const t of ["IHDR", "IDAT", "IEND"]) {
+    if (!stripped.includes(Buffer.from(t))) bad(`stripped PNG missing ${t}`);
+  }
+  ok("stripped PNG keeps IHDR/IDAT/IEND");
+
+  // JPEG: hand-rolled minimal SOI + APP1(EXIF) + SOS...EOI, verify APP1 is gone.
+  const jpg = Buffer.concat([
+    Buffer.from([0xff, 0xd8]),
+    Buffer.from([0xff, 0xe1, 0x00, 0x08]), Buffer.from("ExifXX"),
+    Buffer.from([0xff, 0xeb, 0x00, 0x08]), Buffer.from("JUMBFX"),  // APP11 — C2PA
+    Buffer.from([0xff, 0xda, 0x00, 0x02]), Buffer.from([0x00, 0x00]),  // bare SOS; EOI next
+    Buffer.from([0xff, 0xd9]),
+  ]);
+  const jpgOut = stripMetadata(jpg);
+  console.log("  jpeg before:", jpg.length, "after:", jpgOut.length);
+  if (jpgOut.includes(Buffer.from("Exif"))) bad("APP1/EXIF survived JPEG strip");
+  else ok("APP1/EXIF stripped from JPEG");
+  if (jpgOut.includes(Buffer.from("JUMBF"))) bad("APP11/JUMBF survived JPEG strip");
+  else ok("APP11/JUMBF stripped from JPEG");
+}
+
 async function case12_authExpiredShape() {
   console.log("=== case 12: 401 fallback carries code: AUTH_EXPIRED");
   const { send } = await import("../src/send.mjs");
@@ -294,6 +350,7 @@ const run = async () => {
   await case9bis_bareCustomGpt();
   await case10_daemonSend();
   await case11_rateLimitShape();
+  await case12bis_stripMetadata();
   await case12_authExpiredShape();
   console.log(process.exitCode ? "\nFAILED" : "\nALL PASSED");
 };
