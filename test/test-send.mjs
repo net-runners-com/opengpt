@@ -313,6 +313,51 @@ async function case12bis_stripMetadata() {
   else ok("APP11/JUMBF stripped from JPEG");
 }
 
+async function case12ter_scrubPixels() {
+  console.log("=== case 12c: scrubPixels perturbs pixels + re-encodes");
+  const { scrubPixels } = await import("../src/send.mjs");
+  const zlib = await import("node:zlib");
+  // Build a tiny solid-red PNG (same recipe as case 6).
+  const W = 8, H = 8;
+  const raw = Buffer.concat(Array.from({ length: H }, () =>
+    Buffer.concat([Buffer.from([0]), Buffer.from(Array.from({ length: W }, () => [0xff, 0, 0]).flat())])));
+  const idat = zlib.deflateSync(raw);
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length, 0);
+    const t = Buffer.from(type, "ascii");
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(Buffer.concat([t, data])), 0);
+    return Buffer.concat([len, t, data, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr), chunk("IDAT", idat), chunk("IEND", Buffer.alloc(0)),
+  ]);
+
+  // PNG path: output is still PNG, same dimensions, pixel bytes changed.
+  const pngR = await scrubPixels(png);
+  if (pngR.ext !== "png") bad(`expected ext png, got ${pngR.ext}`);
+  else ok("scrub(default) → png");
+  // Confirm the IDAT byte stream differs (pixels perturbed → different deflate).
+  const origIdatStart = png.indexOf(Buffer.from("IDAT")) + 4;
+  const outIdatStart = pngR.buf.indexOf(Buffer.from("IDAT")) + 4;
+  if (origIdatStart < 0 || outIdatStart < 0) bad("could not locate IDAT in before/after");
+  else if (png.subarray(origIdatStart, origIdatStart + 32).equals(pngR.buf.subarray(outIdatStart, outIdatStart + 32))) {
+    bad("IDAT bytes identical — scrub did not perturb pixels");
+  } else ok("IDAT bytes differ after scrub (pixels perturbed)");
+
+  // JPEG path: output starts with SOI, no PNG magic.
+  const jpgR = await scrubPixels(png, { jpegQuality: 92 });
+  if (jpgR.ext !== "jpg") bad(`expected ext jpg, got ${jpgR.ext}`);
+  else ok("scrub(jpegQuality) → jpg");
+  if (jpgR.buf[0] !== 0xff || jpgR.buf[1] !== 0xd8) bad("JPEG output missing SOI");
+  else ok("JPEG output is a valid JPEG");
+  if (jpgR.buf.includes(Buffer.from("Exif")) || jpgR.buf.includes(Buffer.from("JUMBF"))) {
+    bad("re-encoded JPEG picked up EXIF/JUMBF (sharp default should strip)");
+  } else ok("JPEG re-encode produces clean file");
+}
+
 async function case12_authExpiredShape() {
   console.log("=== case 12: 401 fallback carries code: AUTH_EXPIRED");
   const { send } = await import("../src/send.mjs");
@@ -351,6 +396,7 @@ const run = async () => {
   await case10_daemonSend();
   await case11_rateLimitShape();
   await case12bis_stripMetadata();
+  await case12ter_scrubPixels();
   await case12_authExpiredShape();
   console.log(process.exitCode ? "\nFAILED" : "\nALL PASSED");
 };

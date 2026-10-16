@@ -313,6 +313,43 @@ export function stripMetadata(buf) {
   return buf;
 }
 
+// Pixel-level scrubbing: on top of metadata stripping, perturb the actual
+// pixels so an invisible statistical watermark (SynthID-style) and an
+// AI-origin classifier have less to lock onto. Two cheap transforms, both
+// imperceptible: light gaussian noise and a JPEG re-encode. Keeps the output
+// as PNG unless the caller asks for JPEG (jpegQuality != null).
+//
+// Light tuning: amp=2 on 8-bit channels moves most pixels by ±1 which is
+// invisible to the eye but destroys exact bit-level embedded signals;
+// jpeg q=92 preserves perceptual quality while re-quantizing the frequency
+// domain, which eats fragile frequency-domain watermarks.
+export async function scrubPixels(buf, { amp = 2, jpegQuality = null, format = "png" } = {}) {
+  const sharp = (await import("sharp")).default;
+  // Decode once; add noise to the raw RGB(A) buffer; re-encode.
+  const img = sharp(buf, { failOn: "none" });
+  const { data, info } = await img.raw().toBuffer({ resolveWithObject: true });
+  if (amp > 0) {
+    const chans = info.channels;
+    // Box-Muller for a cheap gaussian; alpha channel left alone so edges
+    // around transparent regions stay crisp.
+    for (let i = 0; i < data.length; i += chans) {
+      for (let c = 0; c < Math.min(3, chans); c++) {
+        const u1 = Math.random() || 1e-9;
+        const u2 = Math.random();
+        const g = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        const v = data[i + c] + Math.round(g * amp);
+        data[i + c] = v < 0 ? 0 : v > 255 ? 255 : v;
+      }
+    }
+  }
+  const re = sharp(data, { raw: { width: info.width, height: info.height, channels: info.channels } });
+  if (format === "jpeg" || jpegQuality != null) {
+    return { buf: await re.jpeg({ quality: jpegQuality ?? 92, mozjpeg: true }).toBuffer(), ext: "jpg" };
+  }
+  // PNG re-encode. Compression 9 to not inflate the file.
+  return { buf: await re.png({ compressionLevel: 9 }).toBuffer(), ext: "png" };
+}
+
 // Generated images download over plain HTTP: ask for a signed URL, then fetch
 // WITH bearer + cookie. The signature alone 403s.
 const EXT = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
@@ -673,6 +710,11 @@ export async function send({
   // keepMetadata: default false — scrub C2PA/EXIF/JUMBF from downloaded
   // images on the way to disk. Opt in to retain the AI-provenance tag.
   keepMetadata = false,
+  // scrub: on top of metadata strip, perturb pixels + re-encode to break
+  // invisible watermarks / classifier signatures. Opt-in because it alters
+  // the actual image (minor perceptual change, acceptable for most reposts).
+  // Accepts true | {amp?, jpegQuality?} for finer control.
+  scrub = false,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
 
@@ -708,9 +750,15 @@ export async function send({
       for (const im of res.images) {
         try {
           const { buf } = await downloadAsset(account, im.id, via);
-          const clean = keepMetadata ? buf : stripMetadata(buf);
-          const p = path.join(saveDir, `${res.conversationId || "img"}-${im.id.replace(/^file_0*/, "").slice(0, 12)}.${EXT[im.mime] || "png"}`);
-          fs.writeFileSync(p, clean);
+          let out = keepMetadata ? buf : stripMetadata(buf);
+          let ext = EXT[im.mime] || "png";
+          if (scrub) {
+            const opts = typeof scrub === "object" && scrub ? scrub : {};
+            const r = await scrubPixels(out, opts);
+            out = r.buf; ext = r.ext;
+          }
+          const p = path.join(saveDir, `${res.conversationId || "img"}-${im.id.replace(/^file_0*/, "").slice(0, 12)}.${ext}`);
+          fs.writeFileSync(p, out);
           res.savedPaths.push(p);
         } catch { /* skip a failed image, keep the rest */ }
       }
