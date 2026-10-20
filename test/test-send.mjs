@@ -358,6 +358,67 @@ async function case12ter_scrubPixels() {
   } else ok("JPEG re-encode produces clean file");
 }
 
+async function case13_modelSlug() {
+  console.log("=== case 13: --model routes an explicit slug");
+  // Pick a slug the account definitely has on free tier.
+  const r = await send({ account, model: "gpt-5-6-mini", prompts: "Reply with exactly: m-ok" });
+  console.log("  reply:", trim(r.results[0].text));
+  if (!/m-ok/i.test(r.results[0].text)) bad(`model slug didn't route: ${r.results[0].text.slice(0, 120)}`);
+  else ok("explicit model slug accepted + routed");
+}
+
+async function case14_reasoning() {
+  console.log("=== case 14: --reasoning (system_hints: ['reason'])");
+  const r = await send({
+    account, reasoning: true,
+    prompts: "17 x 23 を計算して。最後の行だけ答えの数字だけ。",
+  });
+  console.log("  reply:", trim(r.results[0].text).slice(0, 160));
+  // 17 * 23 = 391 — pedantic correctness check.
+  if (!/391/.test(r.results[0].text)) bad(`reasoning didn't produce 391: ${r.results[0].text.slice(0, 160)}`);
+  else ok("reasoning path returned the right number");
+}
+
+async function case15_search() {
+  console.log("=== case 15: --search (best-effort web search)");
+  const r = await send({
+    account, search: true,
+    prompts: "一言で: 今日は何月何日ですか。",
+  });
+  console.log("  reply:", trim(r.results[0].text));
+  // Just verify the send went through without server rejection. Whether real
+  // search fires isn't guaranteed on every account; a date-ish answer is enough.
+  if (!r.results[0].text) bad("search send returned empty");
+  else ok("search send accepted by server");
+}
+
+async function case16_imageSize() {
+  console.log("=== case 16: --size appends a size directive to the prompt");
+  const { send: realSend } = await import("../src/send.mjs");
+  // Intercept /f/conversation to inspect the body — don't actually fire the full image gen.
+  const realFetch = globalThis.fetch;
+  let capturedPrompt = null;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.endsWith("/backend-api/f/conversation") && init?.body) {
+      try {
+        const b = JSON.parse(init.body);
+        capturedPrompt = b.messages?.[0]?.content?.parts?.find(p => typeof p === "string") || null;
+      } catch {}
+      // Short-circuit — don't wait for a real image gen.
+      return new Response(JSON.stringify({ detail: "test-interrupt" }), { status: 400 });
+    }
+    return realFetch(url, init);
+  };
+  try {
+    await realSend({ account, imageSize: "1024x1792", prompts: "空の画像を生成" });
+  } catch { /* expected 400 */ }
+  globalThis.fetch = realFetch;
+  console.log("  prompt sent:", (capturedPrompt || "").replace(/\n/g, " "));
+  if (!capturedPrompt) bad("didn't capture prompt");
+  else if (!/1024x1792/.test(capturedPrompt)) bad("size directive not appended");
+  else ok("size directive appended to prompt");
+}
+
 async function case12_authExpiredShape() {
   console.log("=== case 12: 401 fallback carries code: AUTH_EXPIRED");
   const { send } = await import("../src/send.mjs");
@@ -397,6 +458,10 @@ const run = async () => {
   await case11_rateLimitShape();
   await case12bis_stripMetadata();
   await case12ter_scrubPixels();
+  await case13_modelSlug();
+  await case14_reasoning();
+  await case15_search();
+  await case16_imageSize();
   await case12_authExpiredShape();
   console.log(process.exitCode ? "\nFAILED" : "\nALL PASSED");
 };

@@ -541,7 +541,14 @@ async function readSendStream(res, timeoutMs) {
 // `attachments` is a list of {id, libraryId, name, mime, size, width?, height?}
 // — images go into content.parts as asset_pointers, every file goes into
 // metadata.attachments.
-function buildTurn(prompt, { parentId, gizmoId = null, attachments = [] }) {
+//
+// `model`:    override the default "auto" with any slug the account exposes
+//             (see `/backend-api/models`). Unknown slugs 404 "Model not found".
+// `hints`:    extra entries for `system_hints` — "reason" enables the model's
+//             reasoning path (verified via webtrace 2026-10-20). "search" is
+//             best-effort; the backend accepts it but whether real web search
+//             fires depends on the account's search_tool feature flag.
+function buildTurn(prompt, { parentId, gizmoId = null, attachments = [], model = "auto", hints = [], tools = [] }) {
   const images = attachments.filter(a => /^image\//.test(a.mime));
   const parts = [
     ...images.map(a => ({
@@ -571,7 +578,7 @@ function buildTurn(prompt, { parentId, gizmoId = null, attachments = [] }) {
     turn_attribution: { turn_trigger: "composer" },
     action: "next",
     is_do_not_remember: false,
-    model: "auto",
+    model,
     parent_message_id: parentId || "client-created-root",
     timezone: "Asia/Tokyo",
     timezone_offset_min: new Date().getTimezoneOffset(),
@@ -596,9 +603,11 @@ function buildTurn(prompt, { parentId, gizmoId = null, attachments = [] }) {
       weight: 1,
     }],
     supported_encodings: ["v1"],
+    system_hints: hints,
     genui_state_snapshots: [],
     client_prepare_state: "sent",
   };
+  if (tools.length) body.tools = tools;
   // Project / Custom GPT routing — the pool differs enough that the backend
   // returns "Model not found" without these two keys.
   if (gizmoId) {
@@ -617,7 +626,7 @@ async function parentFor(account, convId, via) {
   return a?.nodeId || null;
 }
 
-async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, via, gizmoId, attachments }) {
+async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, via, gizmoId, attachments, model, hints, tools }) {
   const t = {};
   let s = now();
   const parentId = await parentFor(account, convId, via);
@@ -626,7 +635,7 @@ async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, vi
   t.sentinel = now() - s;
 
   s = now();
-  const body = buildTurn(prompt, { parentId, gizmoId, attachments });
+  const body = buildTurn(prompt, { parentId, gizmoId, attachments, model, hints, tools });
   if (convId) body.conversation_id = convId;
   const sendHeaders = {
     ...headers,
@@ -715,6 +724,19 @@ export async function send({
   // the actual image (minor perceptual change, acceptable for most reposts).
   // Accepts true | {amp?, jpegQuality?} for finer control.
   scrub = false,
+  // model: override the default "auto" slug for this turn (e.g. "gpt-6", "gpt-5-6-mini").
+  model = "auto",
+  // reasoning: send system_hints: ["reason"] — the "思考" chip equivalent.
+  reasoning = false,
+  // search: best-effort web-search enable. Appends system_hints: ["search"]
+  // and tools: [{type:"web_search"}]. Backend accepts both without complaint;
+  // whether real search actually fires depends on the account's search_tool
+  // feature flag — not verified across tiers.
+  search = false,
+  // imageSize: when generating an image, nudge the model to a specific
+  // dimension via a prompt suffix. The web client itself relies on the model
+  // interpreting natural language, so this is the honest implementation.
+  imageSize = null,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
 
@@ -728,7 +750,10 @@ export async function send({
   for (const p of docs || []) attachments.push(await uploadFile(account, auth, p, { useCase: "my_files", via }));
 
   const timings = { perPrompt: [], uploads: attachments.length };
-  const frame = (p) => (system ? `${system}\n\n${p}` : p);
+  const hints = reasoning ? ["reason"] : (search ? ["search"] : []);
+  const tools = search ? [{ type: "web_search" }] : [];
+  const sizeSuffix = imageSize ? `\n\n(画像サイズは ${imageSize} ピクセルで生成してください。)` : "";
+  const frame = (p) => (system ? `${system}\n\n${p}` : p) + sizeSuffix;
   let convCursor = conversationId;
   const results = [];
   for (let i = 0; i < prompts.length; i++) {
@@ -739,6 +764,7 @@ export async function send({
       convId: convCursor, timeoutMs, via,
       gizmoId: gizmo || null,
       attachments: turnAttachments,
+      model, hints, tools,
     });
     timings.perPrompt.push(r.timings);
     const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };

@@ -22,7 +22,7 @@ import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 // `headed` is kept for `login` (interactive sign-in). `lean` / `no-lean` were
 // browser-only flags from the old composer-driven send; the pure-HTTP rewrite
 // (2026-10-15) made them meaningless, so they're dropped.
-const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "keep-metadata", "scrub", "scrub-jpeg"];
+const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "keep-metadata", "scrub", "scrub-jpeg", "search", "reasoning"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   chat: new Set([...COMMON_BOOLEANS, "json", "list", "compact"]),
@@ -98,6 +98,10 @@ const HELP = `opengpt — ChatGPT backend-api client
          --project <g-p-id>     start the chat inside a project
          --json                 structured output: [{text, images, conversationId}] + timings
          --show-id              print each reply's conversation id (stderr)
+         --model <slug>         override "auto" (e.g. gpt-6, gpt-5-6-mini — see opengpt models)
+         --reasoning            enable the model's reasoning path (system_hints: ["reason"])
+         --search               best-effort web-search (needs search_tool feature on the account)
+         --size <WxH>           ask the image-gen tool for a specific size (e.g. 1024x1792)
          --save-images <dir>    download generated images (image-gen results) to <dir>
          --keep-metadata        preserve C2PA/EXIF on saved images (default: strip)
          --scrub                also perturb pixels + PNG re-encode (breaks invisible watermarks)
@@ -297,6 +301,10 @@ async function main() {
         keepMetadata: !!opts["keep-metadata"],  // default: strip C2PA/EXIF from saved images
         scrub: opts["scrub-jpeg"] ? { jpegQuality: 92 }                      // opt in: pixel noise + JPEG re-encode
              : (opts.scrub ? true : false),                                  // opt in: pixel noise + PNG re-encode
+        model: opts.model && opts.model !== true ? String(opts.model) : "auto",
+        reasoning: !!opts.reasoning,
+        search: !!opts.search,
+        imageSize: opts.size && opts.size !== true ? String(opts.size) : null,
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)
         timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more
