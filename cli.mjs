@@ -22,7 +22,7 @@ import { AUTH_DIR, ensureAuthDir } from "./src/config.mjs";
 // `headed` is kept for `login` (interactive sign-in). `lean` / `no-lean` were
 // browser-only flags from the old composer-driven send; the pure-HTTP rewrite
 // (2026-10-15) made them meaningless, so they're dropped.
-const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "keep-metadata", "scrub", "scrub-jpeg", "search", "reasoning"];
+const COMMON_BOOLEANS = ["headed", "same-chat", "show-id", "time", "raw", "help", "continue", "new", "no-daemon", "daemon", "keep-metadata", "scrub", "scrub-jpeg", "search", "reasoning", "no-memory"];
 const BOOLEAN_FLAGS = {
   send: new Set([...COMMON_BOOLEANS, "json"]),
   chat: new Set([...COMMON_BOOLEANS, "json", "list", "compact"]),
@@ -102,6 +102,7 @@ const HELP = `opengpt — ChatGPT backend-api client
          --reasoning            enable the model's reasoning path (system_hints: ["reason"])
          --search               best-effort web-search (needs search_tool feature on the account)
          --size <WxH>           ask the image-gen tool for a specific size (e.g. 1024x1792)
+         --memory off           don't persist memory from this turn (--no-memory is a boolean alias)
          --save-images <dir>    download generated images (image-gen results) to <dir>
          --keep-metadata        preserve C2PA/EXIF on saved images (default: strip)
          --scrub                also perturb pixels + PNG re-encode (breaks invisible watermarks)
@@ -305,6 +306,9 @@ async function main() {
         reasoning: !!opts.reasoning,
         search: !!opts.search,
         imageSize: opts.size && opts.size !== true ? String(opts.size) : null,
+        // --memory off → is_do_not_remember: true (UI の「一時チャット」相当).
+        // --memory on / 省略時はデフォルト保存。boolean 風に --no-memory も許容。
+        memory: !(opts["no-memory"] || (opts.memory && opts.memory !== true && String(opts.memory).toLowerCase() === "off")),
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null, // upload image(s)
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null, // upload document(s)
         timeoutMs: opts.timeout && opts.timeout !== true ? Number(opts.timeout) : 120000, // image-gen/vision needs more
@@ -426,6 +430,7 @@ async function main() {
         saveDir: opts["save-images"] && opts["save-images"] !== true ? opts["save-images"] : null,
         attach: opts.image && opts.image !== true ? opts.image.split(",").map((s) => s.trim()) : null,
         docs: opts.file && opts.file !== true ? opts.file.split(",").map((s) => s.trim()) : null,
+        memory: !(opts["no-memory"] || (opts.memory && opts.memory !== true && String(opts.memory).toLowerCase() === "off")),
       };
 
       let useDaemon = !opts["no-daemon"] && await daemon.isRunning(account);

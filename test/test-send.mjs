@@ -419,6 +419,39 @@ async function case16_imageSize() {
   else ok("size directive appended to prompt");
 }
 
+async function case17_memoryOff() {
+  console.log("=== case 17: --memory off → is_do_not_remember: true");
+  const { send: realSend } = await import("../src/send.mjs");
+  const realFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.endsWith("/backend-api/f/conversation") && init?.body) {
+      try { captured = JSON.parse(init.body); } catch {}
+      return new Response(JSON.stringify({ detail: "test-interrupt" }), { status: 400 });
+    }
+    return realFetch(url, init);
+  };
+  try { await realSend({ account, memory: false, prompts: "一時メッセージ" }); } catch {}
+  globalThis.fetch = realFetch;
+  if (!captured) bad("didn't capture body");
+  else if (captured.is_do_not_remember !== true) bad(`is_do_not_remember was ${captured.is_do_not_remember}, expected true`);
+  else ok("--memory off sent is_do_not_remember: true");
+  // sanity: default stays false
+  let capturedDefault = null;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.endsWith("/backend-api/f/conversation") && init?.body) {
+      try { capturedDefault = JSON.parse(init.body); } catch {}
+      return new Response(JSON.stringify({ detail: "test-interrupt" }), { status: 400 });
+    }
+    return realFetch(url, init);
+  };
+  try { await realSend({ account, prompts: "通常" }); } catch {}
+  globalThis.fetch = realFetch;
+  if (!capturedDefault) bad("didn't capture default body");
+  else if (capturedDefault.is_do_not_remember !== false) bad(`default is_do_not_remember was ${capturedDefault.is_do_not_remember}, expected false`);
+  else ok("default keeps is_do_not_remember: false");
+}
+
 async function case12_authExpiredShape() {
   console.log("=== case 12: 401 fallback carries code: AUTH_EXPIRED");
   const { send } = await import("../src/send.mjs");
@@ -462,6 +495,7 @@ const run = async () => {
   await case14_reasoning();
   await case15_search();
   await case16_imageSize();
+  await case17_memoryOff();
   await case12_authExpiredShape();
   console.log(process.exitCode ? "\nFAILED" : "\nALL PASSED");
 };

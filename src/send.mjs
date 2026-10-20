@@ -548,7 +548,7 @@ async function readSendStream(res, timeoutMs) {
 //             reasoning path (verified via webtrace 2026-10-20). "search" is
 //             best-effort; the backend accepts it but whether real web search
 //             fires depends on the account's search_tool feature flag.
-function buildTurn(prompt, { parentId, gizmoId = null, attachments = [], model = "auto", hints = [], tools = [] }) {
+function buildTurn(prompt, { parentId, gizmoId = null, attachments = [], model = "auto", hints = [], tools = [], memory = true }) {
   const images = attachments.filter(a => /^image\//.test(a.mime));
   const parts = [
     ...images.map(a => ({
@@ -577,7 +577,7 @@ function buildTurn(prompt, { parentId, gizmoId = null, attachments = [], model =
   const body = {
     turn_attribution: { turn_trigger: "composer" },
     action: "next",
-    is_do_not_remember: false,
+    is_do_not_remember: !memory,
     model,
     parent_message_id: parentId || "client-created-root",
     timezone: "Asia/Tokyo",
@@ -626,7 +626,7 @@ async function parentFor(account, convId, via) {
   return a?.nodeId || null;
 }
 
-async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, via, gizmoId, attachments, model, hints, tools }) {
+async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, via, gizmoId, attachments, model, hints, tools, memory }) {
   const t = {};
   let s = now();
   const parentId = await parentFor(account, convId, via);
@@ -635,7 +635,7 @@ async function sendOne(account, auth, accountId, prompt, { convId, timeoutMs, vi
   t.sentinel = now() - s;
 
   s = now();
-  const body = buildTurn(prompt, { parentId, gizmoId, attachments, model, hints, tools });
+  const body = buildTurn(prompt, { parentId, gizmoId, attachments, model, hints, tools, memory });
   if (convId) body.conversation_id = convId;
   const sendHeaders = {
     ...headers,
@@ -737,6 +737,10 @@ export async function send({
   // dimension via a prompt suffix. The web client itself relies on the model
   // interpreting natural language, so this is the honest implementation.
   imageSize = null,
+  // memory: false → sends is_do_not_remember: true, equivalent to the UI's
+  // "一時チャット" (temporary chat). The turn still produces a reply, but
+  // ChatGPT does not persist memory extracts from it. Default true.
+  memory = true,
 }) {
   if (typeof prompts === "string") prompts = [prompts];
 
@@ -764,7 +768,7 @@ export async function send({
       convId: convCursor, timeoutMs, via,
       gizmoId: gizmo || null,
       attachments: turnAttachments,
-      model, hints, tools,
+      model, hints, tools, memory,
     });
     timings.perPrompt.push(r.timings);
     const res = { text: r.text, images: r.images || [], conversationId: r.conversationId };
